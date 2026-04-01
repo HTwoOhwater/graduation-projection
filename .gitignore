@@ -1,0 +1,12 @@
+datasets
+archieve
+PPT
+*.png
+*.npy
+*.jpg
+*.jpeg
+.venv
+.vscode
+__pycache__
+__MACOSX
+out

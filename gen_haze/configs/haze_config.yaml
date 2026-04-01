@@ -1,0 +1,28 @@
+seed: 123
+output:
+  ext: jpg
+  outdir: ./gen_haze_out
+
+haze:
+  combo_mode: cartesian
+  combinations:
+    - name: dusk_light
+      A: [220, 120, 80]
+      beta: 0.13
+      tint: 0.15
+    - name: sandstorm_heavy
+      A: [210, 190, 140]
+      beta: 0.22
+      tint: 0.08
+
+dataset:
+  train:
+    clean_dir: ../datasets/original_images/sunny
+    depth_dir: ../datasets/depth_images/sunny
+    image_exts: [jpg, jpeg, png, bmp, tif, tiff]
+    random_combo: true
+  val:
+    clean_dir: ../datasets/original_images/cloudy
+    depth_dir: ../datasets/depth_images/cloudy
+    image_exts: [jpg, jpeg, png, bmp, tif, tiff]
+    random_combo: false
