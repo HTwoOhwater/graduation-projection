@@ -4,25 +4,29 @@ output:
   outdir: ./gen_haze_out
 
 haze:
-  combo_mode: cartesian
-  combinations:
-    - name: dusk_light
-      A: [220, 120, 80]
-      beta: 0.13
-      tint: 0.15
-    - name: sandstorm_heavy
-      A: [210, 190, 140]
-      beta: 0.22
-      tint: 0.08
+  A_values:
+    - [235, 225, 210] # bright noon haze
+    - [175, 180, 190] # dense gray fog
+    - [255, 210, 170] # golden hour warm light
+    - [200, 215, 240] # morning blue light
+    - [150, 165, 190] # twilight bluish light
+    - [225, 205, 180] # urban dust haze
+  beta_values: [0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
+  tint: 0.01
 
 dataset:
   train:
-    clean_dir: ../datasets/original_images/sunny
-    depth_dir: ../datasets/depth_images/sunny
+    clean_dir: ../../datasets/train/original_images
+    depth_dir: ../../datasets/train/depth_images
     image_exts: [jpg, jpeg, png, bmp, tif, tiff]
     random_combo: true
-  val:
-    clean_dir: ../datasets/original_images/cloudy
-    depth_dir: ../datasets/depth_images/cloudy
+  valid:
+    clean_dir: ../../datasets/valid/original_images
+    depth_dir: ../../datasets/valid/depth_images
+    image_exts: [jpg, jpeg, png, bmp, tif, tiff]
+    random_combo: false
+  test:
+    clean_dir: ../../datasets/test/original_images
+    depth_dir: ../../datasets/test/depth_images
     image_exts: [jpg, jpeg, png, bmp, tif, tiff]
     random_combo: false

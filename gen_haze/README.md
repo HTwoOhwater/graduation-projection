@@ -1,12 +1,12 @@
 Gen Haze
 ========
 
-`gen_haze.py` 已改为 YAML 配置驱动，并提供两种模式：
+`gen_haze.py` 现在是纯离线生成脚本，不再包含在线 DataLoader 逻辑。
 
-- `single`：单张图像生成（用于快速验证效果）
-- `dataloader`：在线生成 DataLoader（用于训练时按需生成）
+支持两种模式：
 
-两种模式共用同一套核心雾霾生成逻辑，`single` 本质是 `dataset/dataloader` 的本地化单样本实现。
+- `single`：单张图像生成（快速质检）
+- `build`：按配置离线批量生成（用于训练前一次性构建数据集）
 
 安装依赖
 --------
@@ -15,8 +15,6 @@ Gen Haze
 pip install pyyaml
 ```
 
-如果你要用 `dataloader` 模式，还需要 PyTorch。
-
 配置文件
 --------
 
@@ -24,105 +22,62 @@ pip install pyyaml
 
 关键字段：
 
-- `haze.combinations`：雾霾参数组合（每组包含 `A`、`beta`、可选 `tint`、可选 `name`）
-- `dataset.train` / `dataset.val`：数据路径与加载策略
-- `output`：输出目录与图像后缀
+- `haze.A_values`：A 候选集合
+- `haze.beta_values`：beta 候选集合
+- `dataset` 建议包含 `train`、`valid`、`test` 三个 split，`--split all` 会依次处理这三项
 
-示例：
+当前离线生成策略固定为：
 
-```yaml
-seed: 123
-output:
-	ext: jpg
-	outdir: ./gen_haze_out
-
-haze:
-	combinations:
-		- name: dusk_light
-			A: [220, 120, 80]
-			beta: 0.13
-			tint: 0.15
-		- name: sandstorm_heavy
-			A: [210, 190, 140]
-			beta: 0.22
-			tint: 0.08
-
-dataset:
-	train:
-		clean_dir: ../datasets/original_images/sunny
-		depth_dir: ../datasets/depth_images/sunny
-		image_exts: [jpg, jpeg, png, bmp, tif, tiff]
-		random_combo: true
-	val:
-		clean_dir: ../datasets/original_images/cloudy
-		depth_dir: ../datasets/depth_images/cloudy
-		image_exts: [jpg, jpeg, png, bmp, tif, tiff]
-		random_combo: false
-```
+- 每张原图随机选择 2 个 A 索引（可复现，受 seed 控制）
+- 与全部 beta 组合生成
+- 若 beta 有 10 个，则每张原图生成 20 张雾图
+- 命名格式：`{原图名称}_{A_index}_{beta_index}`
 
 单张生成
 --------
 
 ```bash
 python gen_haze.py single \
-	--config ./configs/haze_config.yaml \
-	--img /path/to/clean.jpg \
-	--depth /path/to/depth.png \
-	--combo-name dusk_light
+  --config ./configs/haze_config.yaml \
+  --img /path/to/clean.jpg \
+  --depth /path/to/depth.png \
+  --a-index 0 \
+  --beta-index 1
 ```
 
-或使用索引：
-
-```bash
-python gen_haze.py single \
-	--config ./configs/haze_config.yaml \
-	--img /path/to/clean.jpg \
-	--depth /path/to/depth.png \
-	--combo-index 0
-```
-
-在线 DataLoader 预检查
----------------------
-
-```bash
-python gen_haze.py dataloader \
-	--config ./configs/haze_config.yaml \
-	--split train \
-	--batch-size 4 \
-	--max-batches 2 \
-	--save-preview \
-	--preview-dir ./gen_haze_preview
-```
-
-这会在线生成雾霾图并迭代 DataLoader，同时可保存预览图做快速质检。
-
-代码中训练接入
+离线批量生成
 ------------
 
-你可以直接导入：
+生成所有 split：
 
-```python
-from gen_haze import build_haze_dataloader
-
-loader = build_haze_dataloader(
-		config_path="./gen_haze/configs/haze_config.yaml",
-		split="train",
-		batch_size=8,
-		shuffle=True,
-		num_workers=4,
-		return_tensor=True,
-		list_collate=False,
-)
+```bash
+python gen_haze.py build \
+  --config ./configs/haze_config.yaml \
+  --split all \
+  --overwrite
 ```
 
-如果你的训练图像尺寸不一致，建议：
+只生成 train，且限制前 1000 对样本做快速试跑：
 
-- 在 YAML 里配置 `resize_hw: [H, W]` 保证同尺寸，或
-- 保持 `list_collate=True` 自定义后续拼接逻辑
+```bash
+python gen_haze.py build \
+  --config ./configs/haze_config.yaml \
+  --split train \
+  --max-pairs 1000 \
+  --overwrite
+```
+
+输出结构
+--------
+
+批量生成后输出到：
+
+- `datasets/<split>/haze_images/...`：雾图
+- `datasets/<split>/haze_metadata.csv`：每张输出图对应的 clean/depth 路径与 A/beta 参数
 
 注意事项
 --------
 
-- 深度图支持灰度或彩色编码图。彩色深度图会按 HSV 的 H 通道映射远近。
-- 深度会归一化到 `[0,1]` 后再进入指数透射率模型。
+- 脚本为离线流程设计，适合先构建固定训练/验证/测试集，再进行模型训练。
+- 深度图支持灰度或彩色编码图，彩色深度图会按 HSV 的 H 通道映射远近。
 - 图像与深度图匹配优先按相对路径同名，再回退到文件名 stem 匹配。

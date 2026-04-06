@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""YAML-driven haze generation for single-image validation and online dataloading."""
+"""YAML-driven offline haze generation for single image and dataset builds."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import random
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -13,17 +15,6 @@ import cv2
 import numpy as np
 import yaml
 from PIL import Image
-
-try:
-    import torch
-    from torch.utils.data import DataLoader, Dataset
-
-    TORCH_AVAILABLE = True
-except Exception:
-    TORCH_AVAILABLE = False
-    torch = None
-    DataLoader = None
-    Dataset = object
 
 
 def normalize_to_01(arr: np.ndarray) -> np.ndarray:
@@ -36,21 +27,19 @@ def normalize_to_01(arr: np.ndarray) -> np.ndarray:
 
 
 def load_depth_image(depth_path: str) -> np.ndarray:
-    d = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+    # Minimal assumption: depth files are grayscale images.
+    d = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
     if d is None:
         raise FileNotFoundError(f"Depth image not found or unreadable: {depth_path}")
 
-    if d.ndim == 3:
-        # Color depth map mode: hue-based conversion, larger means farther.
-        hsv = cv2.cvtColor(d, cv2.COLOR_BGR2HSV)
-        h = hsv[..., 0].astype(np.float32)
-        d = h / 179.0
-        return normalize_to_01(d)
+    # Normalize first, then invert to match user's depth format:
+    # black = far (large depth), white = near (small depth).
+    depth_norm = normalize_to_01(d.astype(np.float32))
+    depth_norm = 1.0 - depth_norm
 
-    d = d.astype(np.float32)
-    if d.max() > 1.5:
-        d = d / 255.0
-    return normalize_to_01(d)
+    # Smooth depth to suppress local spikes that can create overly heavy distant haze.
+    depth_norm = cv2.GaussianBlur(depth_norm, (5, 5), sigmaX=1.0)
+    return np.clip(depth_norm, 0.0, 1.0)
 
 
 def parse_A(value: Any) -> np.ndarray:
@@ -120,26 +109,34 @@ def load_config(config_path: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"Config not found: {path}")
     with path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
-    if "haze" not in cfg or "combinations" not in cfg["haze"]:
-        raise ValueError("Config must include haze.combinations")
+    if "haze" not in cfg:
+        raise ValueError("Config must include haze section")
     cfg["_config_path"] = str(path)
     return cfg
 
 
-def parse_haze_combinations(config: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for idx, item in enumerate(config["haze"]["combinations"]):
-        if "A" not in item or "beta" not in item:
-            raise ValueError(f"haze.combinations[{idx}] requires A and beta")
-        out.append(
-            {
-                "name": str(item.get("name", f"combo_{idx}")),
-                "A": parse_A(item["A"]),
-                "beta": float(item["beta"]),
-                "tint": float(item.get("tint", 0.0)),
-            }
-        )
-    return out
+def parse_haze_param_grid(config: Dict[str, Any]) -> Dict[str, Any]:
+    haze_cfg = config.get("haze", {})
+    a_values_raw = haze_cfg.get("A_values")
+    beta_values_raw = haze_cfg.get("beta_values")
+    tint = float(haze_cfg.get("tint", 0.0))
+
+    if a_values_raw is None or beta_values_raw is None:
+        raise ValueError("Config must provide haze.A_values and haze.beta_values")
+
+    a_values = [parse_A(a) for a in a_values_raw]
+    beta_values = [float(b) for b in beta_values_raw]
+
+    if len(a_values) == 0:
+        raise ValueError("haze.A_values is empty")
+    if len(beta_values) == 0:
+        raise ValueError("haze.beta_values is empty")
+
+    return {
+        "A_values": a_values,
+        "beta_values": beta_values,
+        "tint": tint,
+    }
 
 
 def _iter_files_by_ext(root: Path, exts: Sequence[str]) -> List[Path]:
@@ -189,99 +186,121 @@ def match_image_depth_pairs(clean_dir: Path, depth_dir: Path, image_exts: Sequen
     return pairs
 
 
-class HazeOnlineDataset(Dataset):
-    """Online haze generation dataset from paired clean/depth images and haze combinations."""
-
-    def __init__(
-        self,
-        image_depth_pairs: Sequence[Tuple[Path, Path]],
-        haze_combinations: Sequence[Dict[str, Any]],
-        random_combo: bool = True,
-        resize_hw: Optional[Tuple[int, int]] = None,
-        return_tensor: bool = True,
-        seed: int = 123,
-    ) -> None:
-        self.image_depth_pairs = list(image_depth_pairs)
-        self.haze_combinations = list(haze_combinations)
-        self.random_combo = bool(random_combo)
-        self.resize_hw = resize_hw
-        self.return_tensor = bool(return_tensor)
-        self.rng = random.Random(seed)
-
-        if len(self.image_depth_pairs) == 0:
-            raise ValueError("image_depth_pairs is empty")
-        if len(self.haze_combinations) == 0:
-            raise ValueError("haze_combinations is empty")
-        if self.return_tensor and not TORCH_AVAILABLE:
-            raise RuntimeError("PyTorch is required when return_tensor=True")
-
-    def __len__(self) -> int:
-        if self.random_combo:
-            return len(self.image_depth_pairs)
-        return len(self.image_depth_pairs) * len(self.haze_combinations)
-
-    def _choose_combo(self, idx: int) -> Dict[str, Any]:
-        if self.random_combo:
-            return self.haze_combinations[self.rng.randrange(len(self.haze_combinations))]
-        combo_idx = idx // len(self.image_depth_pairs)
-        return self.haze_combinations[combo_idx]
-
-    def _choose_pair(self, idx: int) -> Tuple[Path, Path]:
-        if self.random_combo:
-            return self.image_depth_pairs[idx % len(self.image_depth_pairs)]
-        img_idx = idx % len(self.image_depth_pairs)
-        return self.image_depth_pairs[img_idx]
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        img_path, depth_path = self._choose_pair(idx)
-        combo = self._choose_combo(idx)
-
-        bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise FileNotFoundError(f"Failed to load image: {img_path}")
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        depth = load_depth_image(str(depth_path))
-
-        if self.resize_hw is not None:
-            h, w = self.resize_hw
-            rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
-            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
-
-        tinted = apply_tint(rgb, combo["A"], combo.get("tint", 0.0))
-        haze = generate_haze(tinted, depth, combo["beta"], combo["A"])
-
-        sample: Dict[str, Any] = {
-            "hazy": haze,
-            "clean": rgb,
-            "depth": depth,
-            "beta": float(combo["beta"]),
-            "A": combo["A"].astype(np.float32),
-            "combo_name": combo.get("name", ""),
-            "img_path": str(img_path),
-            "depth_path": str(depth_path),
-        }
-
-        if not self.return_tensor:
-            return sample
-
-        haze_tensor = torch.from_numpy(np.transpose(haze, (2, 0, 1))).float() / 255.0
-        clean_tensor = torch.from_numpy(np.transpose(rgb, (2, 0, 1))).float() / 255.0
-        depth_tensor = torch.from_numpy(depth).float().unsqueeze(0)
-        a_tensor = torch.from_numpy(sample["A"]).float()
-
-        sample["hazy"] = haze_tensor
-        sample["clean"] = clean_tensor
-        sample["depth"] = depth_tensor
-        sample["A"] = a_tensor
-        return sample
+def pick_params(
+    a_values: Sequence[np.ndarray],
+    beta_values: Sequence[float],
+    a_index: int = 0,
+    beta_index: int = 0,
+) -> Tuple[np.ndarray, float]:
+    if a_index < 0 or a_index >= len(a_values):
+        raise ValueError(f"a_index out of range: {a_index}")
+    if beta_index < 0 or beta_index >= len(beta_values):
+        raise ValueError(f"beta_index out of range: {beta_index}")
+    return a_values[a_index], float(beta_values[beta_index])
 
 
-def build_dataset_from_yaml(
+def _load_rgb_and_depth(
+    img_path: Path,
+    depth_path: Path,
+    resize_hw: Optional[Tuple[int, int]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(f"Failed to load image: {img_path}")
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    depth = load_depth_image(str(depth_path))
+
+    if resize_hw is not None:
+        h, w = resize_hw
+        rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    return rgb, depth
+
+
+def _pick_random_a_indices(pair_idx: int, num_a: int, seed: int, pick_count: int = 2) -> List[int]:
+    # Deterministic random per pair for reproducible offline generation.
+    if num_a < pick_count:
+        raise ValueError(f"Need at least {pick_count} A values, but got {num_a}")
+    rng = random.Random(seed + pair_idx * 1000003)
+    return sorted(rng.sample(range(num_a), k=pick_count))
+
+
+def _write_metadata_csv(csv_path: Path, rows: List[Dict[str, Any]]) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "split",
+                "output_path",
+                "clean_path",
+                "depth_path",
+                "a_idx",
+                "beta_idx",
+                "A",
+                "beta",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run_single_from_local_dataloader(
     config_path: str,
-    split: str = "train",
-    return_tensor: bool = True,
-    random_combo_override: Optional[bool] = None,
-) -> HazeOnlineDataset:
+    img_path: str,
+    depth_path: str,
+    a_index: int = 0,
+    beta_index: int = 0,
+    out_path: str = "",
+) -> str:
+    cfg = load_config(config_path)
+    param_grid = parse_haze_param_grid(cfg)
+    A, beta = pick_params(
+        a_values=param_grid["A_values"],
+        beta_values=param_grid["beta_values"],
+        a_index=a_index,
+        beta_index=beta_index,
+    )
+
+    img_p = Path(img_path).resolve()
+    depth_p = Path(depth_path).resolve()
+    rgb, depth = _load_rgb_and_depth(img_p, depth_p, resize_hw=None)
+    tinted = apply_tint(rgb, A, param_grid["tint"])
+    haze = generate_haze(tinted, depth, beta, A)
+
+    out_cfg = cfg.get("output", {})
+    ext = str(out_cfg.get("ext", "jpg"))
+    default_outdir = str(out_cfg.get("outdir", "./gen_haze_out"))
+    cfg_path = Path(cfg["_config_path"])
+    outdir = resolve_path(cfg_path, default_outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if out_path:
+        save_path = Path(out_path).resolve()
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        save_path = Path(
+            build_out_name(
+                img_path=str(img_path),
+                outdir=str(outdir),
+                A=A,
+                beta=beta,
+                ext=ext,
+                tag=f"a{a_index}_b{beta_index}",
+            )
+        )
+    Image.fromarray(haze).save(str(save_path))
+    return str(save_path)
+
+
+def build_split_offline(
+    config_path: str,
+    split: str,
+    overwrite: bool = False,
+    max_pairs: int = 0,
+    seed_override: Optional[int] = None,
+) -> Dict[str, Any]:
     cfg = load_config(config_path)
     cfg_path = Path(cfg["_config_path"])  # already absolute
     split_cfg = cfg.get("dataset", {}).get(split)
@@ -299,110 +318,84 @@ def build_dataset_from_yaml(
             raise ValueError("resize_hw must be [height, width]")
         resize_hw = (int(resize_cfg[0]), int(resize_cfg[1]))
 
-    combos = parse_haze_combinations(cfg)
+    param_grid = parse_haze_param_grid(cfg)
+    a_values = param_grid["A_values"]
+    beta_values = param_grid["beta_values"]
+    tint = param_grid["tint"]
+    seed = int(cfg.get("seed", 123)) if seed_override is None else int(seed_override)
+
     pairs = match_image_depth_pairs(clean_dir, depth_dir, image_exts)
-
-    default_random_combo = bool(split_cfg.get("random_combo", True))
-    random_combo = default_random_combo if random_combo_override is None else random_combo_override
-    seed = int(cfg.get("seed", 123))
-    return HazeOnlineDataset(
-        image_depth_pairs=pairs,
-        haze_combinations=combos,
-        random_combo=random_combo,
-        resize_hw=resize_hw,
-        return_tensor=return_tensor,
-        seed=seed,
-    )
-
-
-def build_haze_dataloader(
-    config_path: str,
-    split: str = "train",
-    batch_size: int = 4,
-    shuffle: bool = True,
-    num_workers: int = 0,
-    return_tensor: bool = True,
-    list_collate: bool = True,
-) -> Any:
-    if not TORCH_AVAILABLE:
-        raise RuntimeError("PyTorch is required to build DataLoader")
-
-    dataset = build_dataset_from_yaml(
-        config_path=config_path,
-        split=split,
-        return_tensor=return_tensor,
-    )
-
-    collate_fn = (lambda batch: batch) if list_collate else None
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
-
-
-def pick_combo(combos: Sequence[Dict[str, Any]], combo_name: str = "", combo_index: int = 0) -> Dict[str, Any]:
-    if combo_name:
-        for c in combos:
-            if c.get("name") == combo_name:
-                return c
-        raise ValueError(f"combo_name not found: {combo_name}")
-    if combo_index < 0 or combo_index >= len(combos):
-        raise ValueError(f"combo_index out of range: {combo_index}")
-    return combos[combo_index]
-
-
-def run_single_from_local_dataloader(
-    config_path: str,
-    img_path: str,
-    depth_path: str,
-    combo_name: str = "",
-    combo_index: int = 0,
-    out_path: str = "",
-) -> str:
-    cfg = load_config(config_path)
-    combos = parse_haze_combinations(cfg)
-    combo = pick_combo(combos, combo_name=combo_name, combo_index=combo_index)
-
-    dataset = HazeOnlineDataset(
-        image_depth_pairs=[(Path(img_path).resolve(), Path(depth_path).resolve())],
-        haze_combinations=[combo],
-        random_combo=False,
-        return_tensor=False,
-        seed=int(cfg.get("seed", 123)),
-    )
-    sample = dataset[0]
+    if max_pairs > 0:
+        pairs = pairs[:max_pairs]
 
     out_cfg = cfg.get("output", {})
-    ext = str(out_cfg.get("ext", "jpg"))
-    default_outdir = str(out_cfg.get("outdir", "./gen_haze_out"))
-    cfg_path = Path(cfg["_config_path"])
-    outdir = resolve_path(cfg_path, default_outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
+    ext = str(out_cfg.get("ext", "jpg")).lstrip(".")
 
-    if out_path:
-        save_path = Path(out_path).resolve()
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        save_path = Path(
-            build_out_name(
-                img_path=str(img_path),
-                outdir=str(outdir),
-                A=sample["A"],
-                beta=sample["beta"],
-                ext=ext,
-                tag=str(sample.get("combo_name", "")),
-            )
-        )
-    Image.fromarray(sample["hazy"]).save(str(save_path))
-    return str(save_path)
+    # New default layout: write haze data into each split folder under datasets/<split>/haze_images.
+    split_root = clean_dir.parent
+    hazy_root = split_root / "haze_images"
+    meta_path = split_root / "haze_metadata.csv"
+
+    if overwrite and hazy_root.exists():
+        shutil.rmtree(hazy_root)
+    if overwrite and meta_path.exists():
+        meta_path.unlink()
+    hazy_root.mkdir(parents=True, exist_ok=True)
+
+    rows: List[Dict[str, Any]] = []
+    total_saved = 0
+    num_a = len(a_values)
+    num_b = len(beta_values)
+
+    if num_a < 2:
+        raise ValueError("haze.A_values must contain at least 2 entries for current generation policy")
+
+    for pair_idx, (img_path, depth_path) in enumerate(pairs):
+        rel = img_path.relative_to(clean_dir)
+        stem = rel.stem
+        out_dir = hazy_root / rel.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rgb, depth = _load_rgb_and_depth(img_path, depth_path, resize_hw)
+
+        chosen_a_indices = _pick_random_a_indices(pair_idx, num_a, seed, pick_count=2)
+        for a_idx in chosen_a_indices:
+            A = a_values[a_idx]
+            for b_idx, beta in enumerate(beta_values):
+                tinted = apply_tint(rgb, A, tint)
+                haze = generate_haze(tinted, depth, beta, A)
+
+                # Naming rule: {original_name}_{A_index}_{beta_index}
+                out_path = out_dir / f"{stem}_{a_idx}_{b_idx}.{ext}"
+                Image.fromarray(haze).save(str(out_path))
+                total_saved += 1
+
+                rows.append(
+                    {
+                        "split": split,
+                        "output_path": str(out_path),
+                        "clean_path": str(img_path),
+                        "depth_path": str(depth_path),
+                        "a_idx": a_idx,
+                        "beta_idx": b_idx,
+                        "A": "|".join(str(int(round(v))) for v in A.tolist()),
+                        "beta": float(beta),
+                    }
+                )
+
+    _write_metadata_csv(meta_path, rows)
+    return {
+        "split": split,
+        "pairs": len(pairs),
+        "images_saved": total_saved,
+        "out_dir": str(hazy_root),
+        "metadata": str(meta_path),
+        "a_per_image": 2,
+        "betas_per_a": num_b,
+    }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="YAML-driven haze generation and online dataloader.")
+    parser = argparse.ArgumentParser(description="YAML-driven offline haze generation.")
     parser.add_argument(
         "--config",
         type=str,
@@ -412,20 +405,18 @@ def parse_args() -> argparse.Namespace:
 
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    p_single = sub.add_parser("single", help="Generate one haze image via localized dataset workflow")
+    p_single = sub.add_parser("single", help="Generate one haze image")
     p_single.add_argument("--img", type=str, required=True, help="Clean image path")
     p_single.add_argument("--depth", type=str, required=True, help="Depth image path")
-    p_single.add_argument("--combo-name", type=str, default="", help="Combination name from haze.combinations")
-    p_single.add_argument("--combo-index", type=int, default=0, help="Combination index if name is not provided")
+    p_single.add_argument("--a-index", type=int, default=0, help="Index in haze.A_values")
+    p_single.add_argument("--beta-index", type=int, default=0, help="Index in haze.beta_values")
     p_single.add_argument("--out", type=str, default="", help="Optional output file path")
 
-    p_loader = sub.add_parser("dataloader", help="Build online dataloader and optionally save preview images")
-    p_loader.add_argument("--split", type=str, default="train", help="Dataset split key under dataset.<split>")
-    p_loader.add_argument("--batch-size", type=int, default=4, help="Batch size")
-    p_loader.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
-    p_loader.add_argument("--max-batches", type=int, default=1, help="How many batches to iterate for quick check")
-    p_loader.add_argument("--save-preview", action="store_true", help="Save first sample of each batch for visual validation")
-    p_loader.add_argument("--preview-dir", type=str, default="./gen_haze_preview", help="Preview output directory")
+    p_build = sub.add_parser("build", help="Offline-generate haze images for a split or all splits")
+    p_build.add_argument("--split", type=str, default="all", help="dataset split key, or 'all'")
+    p_build.add_argument("--overwrite", action="store_true", help="Delete output split folder before writing")
+    p_build.add_argument("--max-pairs", type=int, default=0, help="Limit number of clean-depth pairs per split (0 means all)")
+    p_build.add_argument("--seed", type=int, default=None, help="Optional seed override for random_combo mode")
 
     return parser.parse_args()
 
@@ -438,45 +429,40 @@ def main() -> None:
             config_path=args.config,
             img_path=args.img,
             depth_path=args.depth,
-            combo_name=args.combo_name,
-            combo_index=args.combo_index,
+            a_index=args.a_index,
+            beta_index=args.beta_index,
             out_path=args.out,
         )
         print(f"Saved: {out_path}")
         return
 
-    if args.mode == "dataloader":
-        if not TORCH_AVAILABLE:
-            raise RuntimeError("PyTorch is required for dataloader mode")
+    if args.mode == "build":
+        cfg = load_config(args.config)
+        dataset_cfg = cfg.get("dataset", {})
+        if args.split == "all":
+            # Process three canonical split folders to match current dataset layout.
+            target_splits = [s for s in ("train", "valid", "test") if s in dataset_cfg]
+        else:
+            target_splits = [args.split]
 
-        loader = build_haze_dataloader(
-            config_path=args.config,
-            split=args.split,
-            batch_size=args.batch_size,
-            shuffle=(args.split == "train"),
-            num_workers=args.num_workers,
-            return_tensor=False,
-            list_collate=True,
-        )
+        if not target_splits:
+            raise ValueError("No dataset splits found in config")
 
-        preview_dir = Path(args.preview_dir).resolve()
-        if args.save_preview:
-            preview_dir.mkdir(parents=True, exist_ok=True)
-
-        total = 0
-        for batch_idx, batch in enumerate(loader):
-            if batch_idx >= args.max_batches:
-                break
-            total += len(batch)
-            if args.save_preview and len(batch) > 0:
-                sample = batch[0]
-                out_name = f"{args.split}_b{batch_idx:03d}_{Path(sample['img_path']).stem}.jpg"
-                out_path = preview_dir / out_name
-                Image.fromarray(sample["hazy"]).save(str(out_path))
-                print(f"Preview saved: {out_path}")
-            print(f"Batch {batch_idx}: size={len(batch)}")
-
-        print(f"Iterated {total} samples from split={args.split}")
+        for split in target_splits:
+            summary = build_split_offline(
+                config_path=args.config,
+                split=split,
+                overwrite=args.overwrite,
+                max_pairs=args.max_pairs,
+                seed_override=args.seed,
+            )
+            print(
+                f"[{summary['split']}] pairs={summary['pairs']}, "
+                f"saved={summary['images_saved']}, "
+                f"a_per_image={summary['a_per_image']}, betas_per_a={summary['betas_per_a']}"
+            )
+            print(f"  out_dir: {summary['out_dir']}")
+            print(f"  metadata: {summary['metadata']}")
         return
 
 

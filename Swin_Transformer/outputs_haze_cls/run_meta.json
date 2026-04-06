@@ -1,0 +1,23 @@
+{
+  "train_size": 120000,
+  "valid_size": 40000,
+  "test_size": 40000,
+  "args": {
+    "data_root": "datasets",
+    "output_dir": "Swin_Transformer/outputs_haze_cls",
+    "epochs": 200,
+    "batch_size": 64,
+    "num_workers": 4,
+    "lr": 0.0003,
+    "weight_decay": 0.05,
+    "image_size": 224,
+    "seed": 123,
+    "device": "cuda",
+    "pretrained": true,
+    "amp": true,
+    "max_train_batches": 0,
+    "max_eval_batches": 0,
+    "eval_only": false,
+    "checkpoint": ""
+  }
+}
