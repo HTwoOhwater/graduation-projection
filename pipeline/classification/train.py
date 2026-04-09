@@ -613,13 +613,22 @@ def main() -> None:
         if is_main_process(rank):
             summary.append(result)
 
-    # 汇总多模型结果到 result/classification/summary.json，方便统一比较。
+    # 汇总结果：
+    # - 单模型：summary.json 放到对应模型目录（与 best/last/run_meta 同目录）
+    # - 多模型：summary.json 放到输出根目录，便于统一比较
     if is_main_process(rank):
-        (output_root / "summary.json").write_text(
+        if len(model_list) == 1:
+            summary_dir = output_root / model_list[0]
+        else:
+            summary_dir = output_root
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = summary_dir / "summary.json"
+
+        summary_path.write_text(
             json.dumps(summary, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-        print(f"[summary] saved to {output_root / 'summary.json'}")
+        print(f"[summary] saved to {summary_path}")
 
     cleanup_distributed(distributed)
 
