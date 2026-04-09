@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Train haze concentration classifiers (levels 0-9) with torchvision backbones.
+"""Train haze classifiers with torchvision backbones (beta-only or dual-head A+beta).
 
 Label rule:
 - filename suffix uses ..._{A_index}_{beta_index}.ext
-- beta_index in [0, 9] is used as class label
+- beta_index in [0, 9] is used for haze-level classification
+- A_index can be used for atmospheric-light classification in dual-head mode
 """
 
 from __future__ import annotations
@@ -96,18 +97,21 @@ def distributed_barrier(is_distributed: bool, device: torch.device) -> None:
         dist.barrier()
 
 
-def extract_beta_idx_from_name(path: Path) -> int:
+def extract_labels_from_name(path: Path) -> Tuple[int, int]:
     m = LEVEL_RE.search(path.stem)
     if m is None:
         raise ValueError(f"Cannot parse label from filename: {path.name}")
+    a_idx = int(m.group(1))
     beta_idx = int(m.group(2))
+    if a_idx < 0:
+        raise ValueError(f"a_index out of expected range (>=0) in {path.name}")
     if not (0 <= beta_idx <= 9):
         raise ValueError(f"beta_index out of expected range [0,9] in {path.name}")
-    return beta_idx
+    return a_idx, beta_idx
 
 
 class HazeLevelDataset(Dataset):
-    """Dataset for haze level classification from generated haze images."""
+    """Dataset for haze classification from generated haze images."""
 
     def __init__(self, data_root: Path, split: str, transform: transforms.Compose) -> None:
         self.transform = transform
@@ -115,13 +119,13 @@ class HazeLevelDataset(Dataset):
         if not haze_dir.exists():
             raise FileNotFoundError(f"Split haze directory not found: {haze_dir}")
 
-        self.samples: List[Tuple[Path, int]] = []
-        # 遍历当前 split 下的所有图像，并从文件名解析 beta 等级作为标签。
+        self.samples: List[Tuple[Path, int, int]] = []
+        # 遍历当前 split 下的所有图像，并从文件名解析 A 等级与 beta 等级标签。
         for p in sorted(haze_dir.rglob("*")):
             if not p.is_file() or p.suffix.lower() not in VALID_EXTS:
                 continue
-            label = extract_beta_idx_from_name(p)
-            self.samples.append((p, label))
+            a_idx, beta_idx = extract_labels_from_name(p)
+            self.samples.append((p, a_idx, beta_idx))
 
         if not self.samples:
             raise RuntimeError(f"No haze images found in {haze_dir}")
@@ -129,10 +133,10 @@ class HazeLevelDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        img_path, label = self.samples[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, int]:
+        img_path, a_label, beta_label = self.samples[idx]
         image = Image.open(img_path).convert("RGB")
-        return self.transform(image), label
+        return self.transform(image), a_label, beta_label
 
 
 def make_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Compose]:
@@ -158,34 +162,58 @@ def make_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Com
     return train_tf, eval_tf
 
 
-def make_model(arch: str, num_classes: int, pretrained: bool) -> nn.Module:
-    # 使用 torchvision 官方权重，便于统一比较不同结构。
+class HazeMultiHeadModel(nn.Module):
+    """共享主干 + 双头分类器：A 头与 beta 头。"""
+
+    def __init__(self, backbone: nn.Module, feat_dim: int, beta_classes: int, a_classes: int) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.beta_head = nn.Linear(feat_dim, beta_classes)
+        self.a_head = nn.Linear(feat_dim, a_classes)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feat = self.backbone(x)
+        if feat.ndim > 2:
+            feat = torch.flatten(feat, 1)
+        beta_logits = self.beta_head(feat)
+        a_logits = self.a_head(feat)
+        return beta_logits, a_logits
+
+
+def make_model(arch: str, beta_classes: int, a_classes: int, pretrained: bool) -> nn.Module:
+    # 使用 torchvision 官方权重，构造双头模型（A + beta）。
     if arch == "resnet18":
         model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
-        return model
+        feat_dim = model.fc.in_features
+        model.fc = nn.Identity()
+        return HazeMultiHeadModel(model, feat_dim, beta_classes, a_classes)
     if arch == "resnet50":
         model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
-        return model
+        feat_dim = model.fc.in_features
+        model.fc = nn.Identity()
+        return HazeMultiHeadModel(model, feat_dim, beta_classes, a_classes)
     if arch == "mobilenet_v3_small":
         model = models.mobilenet_v3_small(
             weights=models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
         )
-        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
-        return model
+        feat_dim = model.classifier[-1].in_features
+        model.classifier[-1] = nn.Identity()
+        return HazeMultiHeadModel(model, feat_dim, beta_classes, a_classes)
     if arch == "efficientnet_b0":
         model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
-        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
-        return model
+        feat_dim = model.classifier[-1].in_features
+        model.classifier[-1] = nn.Identity()
+        return HazeMultiHeadModel(model, feat_dim, beta_classes, a_classes)
     if arch == "swin_t":
         model = models.swin_t(weights=models.Swin_T_Weights.DEFAULT if pretrained else None)
-        model.head = nn.Linear(model.head.in_features, num_classes)
-        return model
+        feat_dim = model.head.in_features
+        model.head = nn.Identity()
+        return HazeMultiHeadModel(model, feat_dim, beta_classes, a_classes)
     if arch == "vit_b_16":
         model = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT if pretrained else None)
-        model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
-        return model
+        feat_dim = model.heads.head.in_features
+        model.heads.head = nn.Identity()
+        return HazeMultiHeadModel(model, feat_dim, beta_classes, a_classes)
     raise ValueError(f"Unsupported architecture: {arch}")
 
 
@@ -215,6 +243,7 @@ def run_epoch(
     is_distributed: bool,
     rank: int,
     desc: str,
+    loss_a_weight: float,
     max_batches: int = 0,
 ) -> Dict[str, float]:
     # optimizer 为 None 时表示验证/测试阶段。
@@ -223,23 +252,27 @@ def run_epoch(
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda" and train_mode))
 
     total_loss = 0.0
-    total_correct = 0.0
+    total_beta_correct = 0.0
+    total_a_correct = 0.0
     total_count = 0
 
     iterator = loader
     if is_main_process(rank):
         iterator = tqdm(loader, desc=desc, leave=False)
 
-    for batch_idx, (images, labels) in enumerate(iterator):
+    for batch_idx, (images, a_labels, beta_labels) in enumerate(iterator):
         if max_batches > 0 and batch_idx >= max_batches:
             break
 
         images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        a_labels = a_labels.to(device, non_blocking=True)
+        beta_labels = beta_labels.to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
-            logits = model(images)
-            loss = criterion(logits, labels)
+            beta_logits, a_logits = model(images)
+            loss_beta = criterion(beta_logits, beta_labels)
+            loss_a = criterion(a_logits, a_labels)
+            loss = loss_beta + loss_a_weight * loss_a
 
         if train_mode:
             # 训练阶段执行反向传播与参数更新。
@@ -248,19 +281,24 @@ def run_epoch(
             scaler.step(optimizer)
             scaler.update()
 
-        bs = labels.size(0)
+        bs = beta_labels.size(0)
         total_loss += loss.item() * bs
-        total_correct += float((torch.argmax(logits, dim=1) == labels).sum().item())
+        total_beta_correct += float((torch.argmax(beta_logits, dim=1) == beta_labels).sum().item())
+        total_a_correct += float((torch.argmax(a_logits, dim=1) == a_labels).sum().item())
         total_count += bs
 
     if is_distributed:
-        stat = torch.tensor([total_loss, total_correct, float(total_count)], device=device)
+        stat = torch.tensor([total_loss, total_beta_correct, total_a_correct, float(total_count)], device=device)
         dist.all_reduce(stat, op=dist.ReduceOp.SUM)
-        total_loss, total_correct, total_count = stat.tolist()
+        total_loss, total_beta_correct, total_a_correct, total_count = stat.tolist()
 
     if total_count == 0:
-        return {"loss": 0.0, "acc": 0.0}
-    return {"loss": total_loss / total_count, "acc": total_correct / total_count}
+        return {"loss": 0.0, "beta_acc": 0.0, "a_acc": 0.0}
+    return {
+        "loss": total_loss / total_count,
+        "beta_acc": total_beta_correct / total_count,
+        "a_acc": total_a_correct / total_count,
+    }
 
 
 def evaluate_per_class(
@@ -268,21 +306,27 @@ def evaluate_per_class(
     loader: DataLoader,
     device: torch.device,
     is_distributed: bool,
+    target: str,
+    num_classes: int,
     max_batches: int = 0,
 ) -> Dict[str, float]:
-    # 计算每个浓度等级（0-9）的独立准确率，便于分析模型偏置。
+    # 计算每个类别的独立准确率（target=beta 或 a）。
     model.eval()
-    correct = [0 for _ in range(10)]
-    total = [0 for _ in range(10)]
+    correct = [0 for _ in range(num_classes)]
+    total = [0 for _ in range(num_classes)]
 
     with torch.no_grad():
-        for batch_idx, (images, labels) in enumerate(loader):
+        for batch_idx, (images, a_labels, beta_labels) in enumerate(loader):
             if max_batches > 0 and batch_idx >= max_batches:
                 break
             images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            preds = torch.argmax(model(images), dim=1)
-            for cls in range(10):
+            a_labels = a_labels.to(device, non_blocking=True)
+            beta_labels = beta_labels.to(device, non_blocking=True)
+            beta_logits, a_logits = model(images)
+            labels = beta_labels if target == "beta" else a_labels
+            logits = beta_logits if target == "beta" else a_logits
+            preds = torch.argmax(logits, dim=1)
+            for cls in range(num_classes):
                 mask = labels == cls
                 cls_total = int(mask.sum().item())
                 if cls_total == 0:
@@ -299,7 +343,7 @@ def evaluate_per_class(
         total = [int(x) for x in t.tolist()]
 
     out: Dict[str, float] = {}
-    for cls in range(10):
+    for cls in range(num_classes):
         if total[cls] == 0:
             out[f"class_{cls}"] = -1.0
         else:
@@ -331,6 +375,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-batches", type=int, default=0, help="Debug: limit train batches per epoch")
     parser.add_argument("--max-eval-batches", type=int, default=0, help="Debug: limit valid/test batches")
     parser.add_argument("--early-stop-patience", type=int, default=0, help="Early stopping patience on valid acc (0 disables)")
+    parser.add_argument("--beta-classes", type=int, default=10, help="Number of beta classes")
+    parser.add_argument("--a-classes", type=int, default=6, help="Number of A classes")
+    parser.add_argument("--loss-a-weight", type=float, default=0.5, help="Loss weight for A head in dual-head training")
     parser.add_argument("--eval-only", action="store_true", help="Only evaluate checkpoint on valid and test")
     parser.add_argument("--checkpoint", type=str, default="", help="Path to checkpoint for eval-only or resume")
     parser.add_argument("--distributed", action="store_true", help="Enable DDP training (recommended with torchrun)")
@@ -357,7 +404,12 @@ def run_for_model(
     if is_main_process(rank):
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    model = make_model(arch=model_name, num_classes=10, pretrained=args.pretrained).to(device)
+    model = make_model(
+        arch=model_name,
+        beta_classes=args.beta_classes,
+        a_classes=args.a_classes,
+        pretrained=args.pretrained,
+    ).to(device)
     if distributed:
         if device.type == "cuda":
             model = DDP(model, device_ids=[device.index], output_device=device.index)
@@ -404,6 +456,7 @@ def run_for_model(
             is_distributed=distributed,
             rank=rank,
             desc=f"{model_name}-valid",
+            loss_a_weight=args.loss_a_weight,
             max_batches=args.max_eval_batches,
         )
         test_metrics = run_epoch(
@@ -416,20 +469,44 @@ def run_for_model(
             is_distributed=distributed,
             rank=rank,
             desc=f"{model_name}-test",
+            loss_a_weight=args.loss_a_weight,
             max_batches=args.max_eval_batches,
         )
-        per_class = evaluate_per_class(
-            model, test_loader, device, is_distributed=distributed, max_batches=args.max_eval_batches
+        per_class_beta = evaluate_per_class(
+            model,
+            test_loader,
+            device,
+            is_distributed=distributed,
+            target="beta",
+            num_classes=args.beta_classes,
+            max_batches=args.max_eval_batches,
+        )
+        per_class_a = evaluate_per_class(
+            model,
+            test_loader,
+            device,
+            is_distributed=distributed,
+            target="a",
+            num_classes=args.a_classes,
+            max_batches=args.max_eval_batches,
         )
         if is_main_process(rank):
-            print(f"[{model_name}][eval-only] valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}")
-            print(f"[{model_name}][eval-only] test  loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
+            print(
+                f"[{model_name}][eval-only] valid loss={valid_metrics['loss']:.4f}, "
+                f"beta_acc={valid_metrics['beta_acc']:.4f}, a_acc={valid_metrics['a_acc']:.4f}"
+            )
+            print(
+                f"[{model_name}][eval-only] test  loss={test_metrics['loss']:.4f}, "
+                f"beta_acc={test_metrics['beta_acc']:.4f}, a_acc={test_metrics['a_acc']:.4f}"
+            )
         return {
             "model": model_name,
-            "best_valid_acc": valid_metrics["acc"],
+            "best_valid_acc": valid_metrics["beta_acc"],
             "test_loss": test_metrics["loss"],
-            "test_acc": test_metrics["acc"],
-            "per_class": per_class,
+            "test_beta_acc": test_metrics["beta_acc"],
+            "test_a_acc": test_metrics["a_acc"],
+            "per_class_beta": per_class_beta,
+            "per_class_a": per_class_a,
             "output_dir": str(output_dir),
         }
 
@@ -449,6 +526,7 @@ def run_for_model(
             is_distributed=distributed,
             rank=rank,
             desc=f"{model_name}-train e{epoch}",
+            loss_a_weight=args.loss_a_weight,
             max_batches=args.max_train_batches,
         )
         valid_metrics = run_epoch(
@@ -461,14 +539,15 @@ def run_for_model(
             is_distributed=distributed,
             rank=rank,
             desc=f"{model_name}-valid e{epoch}",
+            loss_a_weight=args.loss_a_weight,
             max_batches=args.max_eval_batches,
         )
 
         if is_main_process(rank):
             print(
                 f"[{model_name}] epoch {epoch:03d} | "
-                f"train loss={train_metrics['loss']:.4f}, acc={train_metrics['acc']:.4f} | "
-                f"valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}"
+                f"train loss={train_metrics['loss']:.4f}, beta_acc={train_metrics['beta_acc']:.4f}, a_acc={train_metrics['a_acc']:.4f} | "
+                f"valid loss={valid_metrics['loss']:.4f}, beta_acc={valid_metrics['beta_acc']:.4f}, a_acc={valid_metrics['a_acc']:.4f}"
             )
 
         ckpt = {
@@ -484,9 +563,9 @@ def run_for_model(
             torch.save(ckpt, output_dir / "last.pt")
 
         # 简化规则：验证集精度只要高于历史最好值，就视为有提升。
-        improved = valid_metrics["acc"] > best_valid_acc
+        improved = valid_metrics["beta_acc"] > best_valid_acc
         if improved:
-            best_valid_acc = valid_metrics["acc"]
+            best_valid_acc = valid_metrics["beta_acc"]
             ckpt["best_valid_acc"] = best_valid_acc
             no_improve_epochs = 0
             ckpt["no_improve_epochs"] = no_improve_epochs
@@ -520,19 +599,42 @@ def run_for_model(
         is_distributed=distributed,
         rank=rank,
         desc=f"{model_name}-test",
+        loss_a_weight=args.loss_a_weight,
         max_batches=args.max_eval_batches,
     )
-    per_class = evaluate_per_class(model, test_loader, device, is_distributed=distributed, max_batches=args.max_eval_batches)
+    per_class_beta = evaluate_per_class(
+        model,
+        test_loader,
+        device,
+        is_distributed=distributed,
+        target="beta",
+        num_classes=args.beta_classes,
+        max_batches=args.max_eval_batches,
+    )
+    per_class_a = evaluate_per_class(
+        model,
+        test_loader,
+        device,
+        is_distributed=distributed,
+        target="a",
+        num_classes=args.a_classes,
+        max_batches=args.max_eval_batches,
+    )
 
     if is_main_process(rank):
         print(f"[{model_name}][final] best valid acc={best_valid_acc:.4f}")
-        print(f"[{model_name}][final] test loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
+        print(
+            f"[{model_name}][final] test loss={test_metrics['loss']:.4f}, "
+            f"beta_acc={test_metrics['beta_acc']:.4f}, a_acc={test_metrics['a_acc']:.4f}"
+        )
     return {
         "model": model_name,
         "best_valid_acc": best_valid_acc,
         "test_loss": test_metrics["loss"],
-        "test_acc": test_metrics["acc"],
-        "per_class": per_class,
+        "test_beta_acc": test_metrics["beta_acc"],
+        "test_a_acc": test_metrics["a_acc"],
+        "per_class_beta": per_class_beta,
+        "per_class_a": per_class_a,
         "output_dir": str(output_dir),
     }
 
