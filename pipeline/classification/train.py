@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a Swin-based haze concentration classifier (levels 0-9).
+"""Train haze concentration classifiers (levels 0-9) with torchvision backbones.
 
 Label rule:
 - filename suffix uses ..._{A_index}_{beta_index}.ext
@@ -25,9 +25,18 @@ from torchvision import models
 
 LEVEL_RE = re.compile(r"_(\d+)_(\d+)$")
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+SUPPORTED_MODELS = (
+    "resnet18",
+    "resnet50",
+    "mobilenet_v3_small",
+    "efficientnet_b0",
+    "swin_t",
+    "vit_b_16",
+)
 
 
 def set_seed(seed: int) -> None:
+    # 固定随机种子，保证多模型对比时结果可复现。
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -53,6 +62,7 @@ class HazeLevelDataset(Dataset):
             raise FileNotFoundError(f"Split haze directory not found: {haze_dir}")
 
         self.samples: List[Tuple[Path, int]] = []
+        # 遍历当前 split 下的所有图像，并从文件名解析 beta 等级作为标签。
         for p in sorted(haze_dir.rglob("*")):
             if not p.is_file() or p.suffix.lower() not in VALID_EXTS:
                 continue
@@ -72,7 +82,7 @@ class HazeLevelDataset(Dataset):
 
 
 def make_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Compose]:
-    # Keep augmentation light to avoid changing haze level semantics too much.
+    # 轻量增强，避免破坏雾霾浓度标签语义。
     train_tf = transforms.Compose(
         [
             transforms.RandomResizedCrop(image_size, scale=(0.85, 1.0)),
@@ -93,24 +103,45 @@ def make_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Com
 
 
 def make_model(arch: str, num_classes: int, pretrained: bool) -> nn.Module:
-    weights = "DEFAULT" if pretrained else None
-    
+    # 使用 torchvision 官方权重，便于统一比较不同结构。
+    if arch == "resnet18":
+        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+        return model
+    if arch == "resnet50":
+        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
+        model.fc = nn.Linear(model.fc.in_features, num_classes)
+        return model
+    if arch == "mobilenet_v3_small":
+        model = models.mobilenet_v3_small(
+            weights=models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
+        )
+        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+        return model
+    if arch == "efficientnet_b0":
+        model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
+        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+        return model
     if arch == "swin_t":
         model = models.swin_t(weights=models.Swin_T_Weights.DEFAULT if pretrained else None)
-        in_features = model.head.in_features
-        model.head = nn.Linear(in_features, num_classes)
-    elif arch == "resnet18":
-        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
-        in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, num_classes)
-    elif arch == "resnet50":
-        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
-        in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, num_classes)
-    else:
-        raise ValueError(f"Unsupported architecture: {arch}")
-        
-    return model
+        model.head = nn.Linear(model.head.in_features, num_classes)
+        return model
+    if arch == "vit_b_16":
+        model = models.vit_b_16(weights=models.ViT_B_16_Weights.DEFAULT if pretrained else None)
+        model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
+        return model
+    raise ValueError(f"Unsupported architecture: {arch}")
+
+
+def parse_models(spec: str, fallback_model: str) -> List[str]:
+    # 支持通过 --models 一次性指定多个模型进行对比。
+    if not spec.strip():
+        return [fallback_model]
+    names = [x.strip() for x in spec.split(",") if x.strip()]
+    invalid = [n for n in names if n not in SUPPORTED_MODELS]
+    if invalid:
+        raise ValueError(f"Unsupported models in --models: {invalid}")
+    return names
 
 
 def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
@@ -127,6 +158,7 @@ def run_epoch(
     use_amp: bool,
     max_batches: int = 0,
 ) -> Dict[str, float]:
+    # optimizer 为 None 时表示验证/测试阶段。
     train_mode = optimizer is not None
     model.train(train_mode)
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda" and train_mode))
@@ -147,6 +179,7 @@ def run_epoch(
             loss = criterion(logits, labels)
 
         if train_mode:
+            # 训练阶段执行反向传播与参数更新。
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -167,6 +200,7 @@ def evaluate_per_class(
     device: torch.device,
     max_batches: int = 0,
 ) -> Dict[str, float]:
+    # 计算每个浓度等级（0-9）的独立准确率，便于分析模型偏置。
     model.eval()
     correct = [0 for _ in range(10)]
     total = [0 for _ in range(10)]
@@ -197,9 +231,15 @@ def evaluate_per_class(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train haze concentration classifier")
-    parser.add_argument("--model", type=str, default="swin_t", choices=["swin_t", "resnet18", "resnet50"], help="Model architecture")
+    parser.add_argument("--model", type=str, default="swin_t", choices=list(SUPPORTED_MODELS), help="Single model architecture")
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="",
+        help="Comma-separated models for multi-run, e.g. resnet18,resnet50,swin_t",
+    )
     parser.add_argument("--data-root", type=str, default="datasets", help="Root containing train/valid/test")
-    parser.add_argument("--output-dir", type=str, default="algorithm/classification/outputs", help="Checkpoint/log output directory")
+    parser.add_argument("--output-dir", type=str, default="result/classification", help="Root output directory")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -217,15 +257,160 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def run_for_model(
+    args: argparse.Namespace,
+    model_name: str,
+    data_root: Path,
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    test_loader: DataLoader,
+    train_size: int,
+    valid_size: int,
+    test_size: int,
+    device: torch.device,
+) -> Dict[str, object]:
+    # 每个模型单独写入 result/classification/<model_name> 目录，避免互相覆盖。
+    output_dir = Path(args.output_dir) / model_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model = make_model(arch=model_name, num_classes=10, pretrained=args.pretrained).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    start_epoch = 1
+    best_valid_acc = -1.0
+    checkpoint_path = args.checkpoint
+    if checkpoint_path:
+        ckpt = torch.load(checkpoint_path, map_location="cpu")
+        model.load_state_dict(ckpt["model"])
+        if "optimizer" in ckpt and not args.eval_only:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_valid_acc = float(ckpt.get("best_valid_acc", -1.0))
+
+    # 记录当前模型运行参数，便于论文复现实验。
+    meta = {
+        "train_size": train_size,
+        "valid_size": valid_size,
+        "test_size": test_size,
+        "model": model_name,
+        "args": vars(args),
+    }
+    (output_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    if args.eval_only:
+        # 仅评估模式：直接读取权重并输出 valid/test 指标。
+        valid_metrics = run_epoch(
+            model,
+            valid_loader,
+            criterion,
+            optimizer=None,
+            device=device,
+            use_amp=args.amp,
+            max_batches=args.max_eval_batches,
+        )
+        test_metrics = run_epoch(
+            model,
+            test_loader,
+            criterion,
+            optimizer=None,
+            device=device,
+            use_amp=args.amp,
+            max_batches=args.max_eval_batches,
+        )
+        per_class = evaluate_per_class(model, test_loader, device, max_batches=args.max_eval_batches)
+        print(f"[{model_name}][eval-only] valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}")
+        print(f"[{model_name}][eval-only] test  loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
+        return {
+            "model": model_name,
+            "best_valid_acc": valid_metrics["acc"],
+            "test_loss": test_metrics["loss"],
+            "test_acc": test_metrics["acc"],
+            "per_class": per_class,
+            "output_dir": str(output_dir),
+        }
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        # 标准训练循环：train -> valid -> 保存 last/best checkpoint。
+        train_metrics = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer=optimizer,
+            device=device,
+            use_amp=args.amp,
+            max_batches=args.max_train_batches,
+        )
+        valid_metrics = run_epoch(
+            model,
+            valid_loader,
+            criterion,
+            optimizer=None,
+            device=device,
+            use_amp=args.amp,
+            max_batches=args.max_eval_batches,
+        )
+
+        print(
+            f"[{model_name}] epoch {epoch:03d} | "
+            f"train loss={train_metrics['loss']:.4f}, acc={train_metrics['acc']:.4f} | "
+            f"valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}"
+        )
+
+        ckpt = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "best_valid_acc": best_valid_acc,
+            "args": vars(args),
+            "model_name": model_name,
+        }
+        torch.save(ckpt, output_dir / "last.pt")
+
+        if valid_metrics["acc"] > best_valid_acc:
+            best_valid_acc = valid_metrics["acc"]
+            ckpt["best_valid_acc"] = best_valid_acc
+            torch.save(ckpt, output_dir / "best.pt")
+
+    best_ckpt = torch.load(output_dir / "best.pt", map_location="cpu")
+    model.load_state_dict(best_ckpt["model"])
+    test_metrics = run_epoch(
+        model,
+        test_loader,
+        criterion,
+        optimizer=None,
+        device=device,
+        use_amp=args.amp,
+        max_batches=args.max_eval_batches,
+    )
+    per_class = evaluate_per_class(model, test_loader, device, max_batches=args.max_eval_batches)
+
+    print(f"[{model_name}][final] best valid acc={best_valid_acc:.4f}")
+    print(f"[{model_name}][final] test loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
+    return {
+        "model": model_name,
+        "best_valid_acc": best_valid_acc,
+        "test_loss": test_metrics["loss"],
+        "test_acc": test_metrics["acc"],
+        "per_class": per_class,
+        "output_dir": str(output_dir),
+    }
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
     data_root = Path(args.data_root)
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    model_list = parse_models(args.models, args.model)
+
+    if len(model_list) > 1 and args.checkpoint:
+        raise ValueError("When using multiple models, please do not pass --checkpoint.")
 
     train_tf, eval_tf = make_transforms(args.image_size)
+    # 三个 split 保持固定划分，避免数据泄漏。
     train_ds = HazeLevelDataset(data_root, "train", train_tf)
     valid_ds = HazeLevelDataset(data_root, "valid", eval_tf)
     test_ds = HazeLevelDataset(data_root, "test", eval_tf)
@@ -256,102 +441,29 @@ def main() -> None:
     )
 
     device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
-    model = make_model(arch=args.model, num_classes=10, pretrained=args.pretrained).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    start_epoch = 1
-    best_valid_acc = -1.0
-    if args.checkpoint:
-        ckpt = torch.load(args.checkpoint, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
-        if "optimizer" in ckpt and not args.eval_only:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_valid_acc = float(ckpt.get("best_valid_acc", -1.0))
-
-    # Save dataset stats for reproducibility.
-    meta = {
-        "train_size": len(train_ds),
-        "valid_size": len(valid_ds),
-        "test_size": len(test_ds),
-        "args": vars(args),
-    }
-    (output_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    if args.eval_only:
-        valid_metrics = run_epoch(
-            model, valid_loader, criterion, optimizer=None, device=device, use_amp=args.amp, max_batches=args.max_eval_batches
-        )
-        test_metrics = run_epoch(
-            model, test_loader, criterion, optimizer=None, device=device, use_amp=args.amp, max_batches=args.max_eval_batches
-        )
-        per_class = evaluate_per_class(model, test_loader, device, max_batches=args.max_eval_batches)
-        print(f"[eval-only] valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}")
-        print(f"[eval-only] test  loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
-        print("[eval-only] test per-class acc:")
-        for k, v in per_class.items():
-            print(f"  {k}: {v:.4f}")
-        return
-
-    for epoch in range(start_epoch, args.epochs + 1):
-        train_metrics = run_epoch(
-            model,
-            train_loader,
-            criterion,
-            optimizer=optimizer,
+    # 依次运行多个模型并汇总结果。
+    summary: List[Dict[str, object]] = []
+    for model_name in model_list:
+        result = run_for_model(
+            args=args,
+            model_name=model_name,
+            data_root=data_root,
+            train_loader=train_loader,
+            valid_loader=valid_loader,
+            test_loader=test_loader,
+            train_size=len(train_ds),
+            valid_size=len(valid_ds),
+            test_size=len(test_ds),
             device=device,
-            use_amp=args.amp,
-            max_batches=args.max_train_batches,
         )
-        valid_metrics = run_epoch(
-            model,
-            valid_loader,
-            criterion,
-            optimizer=None,
-            device=device,
-            use_amp=args.amp,
-            max_batches=args.max_eval_batches,
-        )
+        summary.append(result)
 
-        print(
-            f"epoch {epoch:03d} | "
-            f"train loss={train_metrics['loss']:.4f}, acc={train_metrics['acc']:.4f} | "
-            f"valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}"
-        )
-
-        ckpt = {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "best_valid_acc": best_valid_acc,
-            "args": vars(args),
-        }
-        torch.save(ckpt, output_dir / "last.pt")
-
-        if valid_metrics["acc"] > best_valid_acc:
-            best_valid_acc = valid_metrics["acc"]
-            ckpt["best_valid_acc"] = best_valid_acc
-            torch.save(ckpt, output_dir / "best.pt")
-
-    best_ckpt = torch.load(output_dir / "best.pt", map_location="cpu")
-    model.load_state_dict(best_ckpt["model"])
-    test_metrics = run_epoch(
-        model,
-        test_loader,
-        criterion,
-        optimizer=None,
-        device=device,
-        use_amp=args.amp,
-        max_batches=args.max_eval_batches,
+    # 汇总多模型结果到 result/classification/summary.json，方便统一比较。
+    (output_root / "summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
-    per_class = evaluate_per_class(model, test_loader, device, max_batches=args.max_eval_batches)
-
-    print(f"[final] best valid acc={best_valid_acc:.4f}")
-    print(f"[final] test loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
-    print("[final] test per-class acc:")
-    for k, v in per_class.items():
-        print(f"  {k}: {v:.4f}")
+    print(f"[summary] saved to {output_root / 'summary.json'}")
 
 
 if __name__ == "__main__":

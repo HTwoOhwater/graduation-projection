@@ -18,6 +18,7 @@ from PIL import Image
 
 
 def normalize_to_01(arr: np.ndarray) -> np.ndarray:
+    # 将任意数值范围线性归一化到 [0, 1]。
     arr = arr.astype(np.float32)
     mn = float(np.min(arr))
     mx = float(np.max(arr))
@@ -27,22 +28,22 @@ def normalize_to_01(arr: np.ndarray) -> np.ndarray:
 
 
 def load_depth_image(depth_path: str) -> np.ndarray:
-    # Minimal assumption: depth files are grayscale images.
+    # 深度图按灰度读取（当前数据约定：灰度图表达深度）。
     d = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
     if d is None:
         raise FileNotFoundError(f"Depth image not found or unreadable: {depth_path}")
 
-    # Normalize first, then invert to match user's depth format:
-    # black = far (large depth), white = near (small depth).
+    # 先归一化再反转，匹配当前数据语义：黑=远，白=近。
     depth_norm = normalize_to_01(d.astype(np.float32))
     depth_norm = 1.0 - depth_norm
 
-    # Smooth depth to suppress local spikes that can create overly heavy distant haze.
+    # 对深度做轻微高斯平滑，抑制远景局部尖峰导致的雾化过重。
     depth_norm = cv2.GaussianBlur(depth_norm, (5, 5), sigmaX=1.0)
     return np.clip(depth_norm, 0.0, 1.0)
 
 
 def parse_A(value: Any) -> np.ndarray:
+    # 支持标量/字符串/列表三种输入形式，并统一转为 RGB 三通道 A 值。
     if isinstance(value, (int, float)):
         vals = [float(value)]
     elif isinstance(value, str):
@@ -66,6 +67,7 @@ def parse_A(value: Any) -> np.ndarray:
 
 
 def apply_tint(rgb_image: np.ndarray, A: np.ndarray, tint: float) -> np.ndarray:
+    # 将全局大气光 A 以指定强度混入原图，模拟整体色调偏移。
     tint_strength = float(np.clip(tint, 0.0, 1.0))
     if tint_strength <= 0.0:
         return rgb_image
@@ -75,6 +77,7 @@ def apply_tint(rgb_image: np.ndarray, A: np.ndarray, tint: float) -> np.ndarray:
 
 
 def generate_haze(rgb_image: np.ndarray, depth_norm: np.ndarray, beta: float, A: np.ndarray) -> np.ndarray:
+    # 按经典散射模型 I(x)=J(x)t(x)+A(1-t(x)) 合成雾图。
     depth_scaled = depth_norm * (10.0 - 0.1) + 0.1
     transmission = np.exp(-beta * depth_scaled)
     j_weighted = rgb_image.astype(np.float32) * transmission[..., None]
@@ -164,6 +167,7 @@ def match_image_depth_pairs(clean_dir: Path, depth_dir: Path, image_exts: Sequen
 
     pairs: List[Tuple[Path, Path]] = []
     for img_path in clean_files:
+        # 优先按相对路径 + 同名匹配；失败时退化到全局同 stem 匹配。
         rel = img_path.relative_to(clean_dir)
         rel_parent = rel.parent
         rel_stem = rel.stem
@@ -204,6 +208,7 @@ def _load_rgb_and_depth(
     depth_path: Path,
     resize_hw: Optional[Tuple[int, int]],
 ) -> Tuple[np.ndarray, np.ndarray]:
+    # 统一读取 RGB 与深度，并按需要重采样到固定尺寸。
     bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
     if bgr is None:
         raise FileNotFoundError(f"Failed to load image: {img_path}")
@@ -219,7 +224,7 @@ def _load_rgb_and_depth(
 
 
 def _pick_random_a_indices(pair_idx: int, num_a: int, seed: int, pick_count: int = 2) -> List[int]:
-    # Deterministic random per pair for reproducible offline generation.
+    # 按样本索引构造确定性随机种子，保证离线生成可复现。
     if num_a < pick_count:
         raise ValueError(f"Need at least {pick_count} A values, but got {num_a}")
     rng = random.Random(seed + pair_idx * 1000003)
@@ -227,6 +232,7 @@ def _pick_random_a_indices(pair_idx: int, num_a: int, seed: int, pick_count: int
 
 
 def _write_metadata_csv(csv_path: Path, rows: List[Dict[str, Any]]) -> None:
+    # 统一写出元数据，便于后续训练/追溯参数组合。
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
@@ -254,6 +260,7 @@ def run_single_from_local_dataloader(
     beta_index: int = 0,
     out_path: str = "",
 ) -> str:
+    # 单样本模式：用于快速验证某一组 A/beta 的合成效果。
     cfg = load_config(config_path)
     param_grid = parse_haze_param_grid(cfg)
     A, beta = pick_params(
@@ -301,6 +308,7 @@ def build_split_offline(
     max_pairs: int = 0,
     seed_override: Optional[int] = None,
 ) -> Dict[str, Any]:
+    # 按 split 进行批量离线生成：每张图随机 2 个 A，并遍历全部 beta。
     cfg = load_config(config_path)
     cfg_path = Path(cfg["_config_path"])  # already absolute
     split_cfg = cfg.get("dataset", {}).get(split)
@@ -331,7 +339,7 @@ def build_split_offline(
     out_cfg = cfg.get("output", {})
     ext = str(out_cfg.get("ext", "jpg")).lstrip(".")
 
-    # New default layout: write haze data into each split folder under datasets/<split>/haze_images.
+    # 默认输出布局：datasets/<split>/haze_images + haze_metadata.csv。
     split_root = clean_dir.parent
     hazy_root = split_root / "haze_images"
     meta_path = split_root / "haze_metadata.csv"
@@ -364,7 +372,7 @@ def build_split_offline(
                 tinted = apply_tint(rgb, A, tint)
                 haze = generate_haze(tinted, depth, beta, A)
 
-                # Naming rule: {original_name}_{A_index}_{beta_index}
+                # 命名规则：{original_name}_{A_index}_{beta_index}
                 out_path = out_dir / f"{stem}_{a_idx}_{b_idx}.{ext}"
                 Image.fromarray(haze).save(str(out_path))
                 total_saved += 1
@@ -395,6 +403,7 @@ def build_split_offline(
 
 
 def parse_args() -> argparse.Namespace:
+    # 命令行支持 single/build 两种模式。
     parser = argparse.ArgumentParser(description="YAML-driven offline haze generation.")
     parser.add_argument(
         "--config",
@@ -440,7 +449,7 @@ def main() -> None:
         cfg = load_config(args.config)
         dataset_cfg = cfg.get("dataset", {})
         if args.split == "all":
-            # Process three canonical split folders to match current dataset layout.
+            # all 模式下按 train/valid/test 三个标准 split 依次处理。
             target_splits = [s for s in ("train", "valid", "test") if s in dataset_cfg]
         else:
             target_splits = [args.split]

@@ -1,31 +1,52 @@
-Haze Level Classifier (Swin-T)
-==============================
+Haze Level Classification (Multi-Backbone)
+==========================================
 
-This script trains a 10-class haze concentration classifier from generated haze images.
+This module trains a 10-class haze concentration classifier using torchvision backbones.
 
-Label rule
+Supported Models
+----------------
+
+- `resnet18`
+- `resnet50`
+- `mobilenet_v3_small`
+- `efficientnet_b0`
+- `swin_t`
+- `vit_b_16`
+
+Label Rule
 ----------
 
 Image names must end with:
 
-{original_name}_{A_index}_{beta_index}.jpg
+`{original_name}_{A_index}_{beta_index}.jpg`
 
-`beta_index` in `[0, 9]` is used as class label.
+`beta_index` in `[0, 9]` is used as the class label.
 
-Expected data layout
+Expected Data Layout
 --------------------
 
 - `datasets/train/haze_images`
 - `datasets/valid/haze_images`
 - `datasets/test/haze_images`
 
-Quick run
----------
+Output Directory
+----------------
+
+All results are unified under:
+
+- `result/classification/<model_name>/best.pt`
+- `result/classification/<model_name>/last.pt`
+- `result/classification/<model_name>/run_meta.json`
+- `result/classification/summary.json`
+
+Train Single Model
+------------------
 
 ```bash
-.venv/bin/python Swin_Transformer/train_haze_classifier.py \
+.venv/bin/python pipeline/classification/train.py \
+  --model resnet50 \
   --data-root datasets \
-  --output-dir Swin_Transformer/outputs_haze_cls \
+  --output-dir result/classification \
   --epochs 10 \
   --batch-size 64 \
   --num-workers 4 \
@@ -33,11 +54,27 @@ Quick run
   --amp
 ```
 
-Fast smoke test
+Train Multiple Models in One Run
+--------------------------------
+
+```bash
+.venv/bin/python pipeline/classification/train.py \
+  --models resnet18,resnet50,swin_t,vit_b_16 \
+  --data-root datasets \
+  --output-dir result/classification \
+  --epochs 10 \
+  --batch-size 32 \
+  --num-workers 4 \
+  --pretrained \
+  --amp
+```
+
+Fast Smoke Test
 ---------------
 
 ```bash
-.venv/bin/python Swin_Transformer/train_haze_classifier.py \
+.venv/bin/python pipeline/classification/train.py \
+  --models resnet18,swin_t \
   --data-root datasets \
   --epochs 1 \
   --batch-size 8 \
@@ -46,12 +83,13 @@ Fast smoke test
   --max-eval-batches 2
 ```
 
-Evaluate checkpoint
+Evaluate Checkpoint
 -------------------
 
 ```bash
-.venv/bin/python Swin_Transformer/train_haze_classifier.py \
+.venv/bin/python pipeline/classification/train.py \
+  --model resnet18 \
   --data-root datasets \
   --eval-only \
-  --checkpoint Swin_Transformer/outputs_haze_cls/best.pt
+  --checkpoint result/classification/resnet18/best.pt
 ```
