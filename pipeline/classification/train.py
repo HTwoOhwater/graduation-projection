@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
+import torch.distributed as dist
 from PIL import Image
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DistributedSampler
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 from torchvision import transforms
 from torchvision import models
 
@@ -40,6 +45,35 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def init_distributed(args: argparse.Namespace) -> Tuple[bool, int, int, int]:
+    """初始化分布式环境，返回 (is_distributed, rank, world_size, local_rank)。"""
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    use_distributed = args.distributed or env_world_size > 1
+    if not use_distributed:
+        return False, 0, 1, 0
+
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if torch.cuda.is_available() and args.device == "cuda":
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=args.dist_backend)
+    else:
+        dist.init_process_group(backend="gloo")
+
+    return True, rank, world_size, local_rank
+
+
+def cleanup_distributed(is_distributed: bool) -> None:
+    if is_distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
 
 
 def extract_beta_idx_from_name(path: Path) -> int:
@@ -82,20 +116,21 @@ class HazeLevelDataset(Dataset):
 
 
 def make_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Compose]:
-    # 轻量增强，避免破坏雾霾浓度标签语义。
+    # 统一将图像缩放到固定分辨率，确保 DataLoader 可正常 stack。
+    # 注意：Resize(单个整数)只会固定短边，长边仍可变，容易引发 batch 尺寸不一致报错。
+    fixed_resize = transforms.Resize((image_size, image_size))
+
+    # 无增强训练版本：用于先验证模型泛化问题，避免随机变换带来的额外扰动。
     train_tf = transforms.Compose(
         [
-            # transforms.RandomResizedCrop(image_size, scale=(0.85, 1.0)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.5),
+            fixed_resize,
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
     eval_tf = transforms.Compose(
         [
-            # transforms.Resize(int(image_size * 1.14)),
-            # transforms.CenterCrop(image_size),
+            fixed_resize,
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
@@ -157,6 +192,9 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None,
     device: torch.device,
     use_amp: bool,
+    is_distributed: bool,
+    rank: int,
+    desc: str,
     max_batches: int = 0,
 ) -> Dict[str, float]:
     # optimizer 为 None 时表示验证/测试阶段。
@@ -165,10 +203,14 @@ def run_epoch(
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and device.type == "cuda" and train_mode))
 
     total_loss = 0.0
-    total_acc = 0.0
-    steps = 0
+    total_correct = 0.0
+    total_count = 0
 
-    for batch_idx, (images, labels) in enumerate(loader):
+    iterator = loader
+    if is_main_process(rank):
+        iterator = tqdm(loader, desc=desc, leave=False)
+
+    for batch_idx, (images, labels) in enumerate(iterator):
         if max_batches > 0 and batch_idx >= max_batches:
             break
 
@@ -186,19 +228,26 @@ def run_epoch(
             scaler.step(optimizer)
             scaler.update()
 
-        total_loss += loss.item()
-        total_acc += accuracy(logits, labels)
-        steps += 1
+        bs = labels.size(0)
+        total_loss += loss.item() * bs
+        total_correct += float((torch.argmax(logits, dim=1) == labels).sum().item())
+        total_count += bs
 
-    if steps == 0:
+    if is_distributed:
+        stat = torch.tensor([total_loss, total_correct, float(total_count)], device=device)
+        dist.all_reduce(stat, op=dist.ReduceOp.SUM)
+        total_loss, total_correct, total_count = stat.tolist()
+
+    if total_count == 0:
         return {"loss": 0.0, "acc": 0.0}
-    return {"loss": total_loss / steps, "acc": total_acc / steps}
+    return {"loss": total_loss / total_count, "acc": total_correct / total_count}
 
 
 def evaluate_per_class(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    is_distributed: bool,
     max_batches: int = 0,
 ) -> Dict[str, float]:
     # 计算每个浓度等级（0-9）的独立准确率，便于分析模型偏置。
@@ -220,6 +269,14 @@ def evaluate_per_class(
                     continue
                 total[cls] += cls_total
                 correct[cls] += int((preds[mask] == labels[mask]).sum().item())
+
+    if is_distributed:
+        c = torch.tensor(correct, device=device, dtype=torch.float64)
+        t = torch.tensor(total, device=device, dtype=torch.float64)
+        dist.all_reduce(c, op=dist.ReduceOp.SUM)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        correct = [int(x) for x in c.tolist()]
+        total = [int(x) for x in t.tolist()]
 
     out: Dict[str, float] = {}
     for cls in range(10):
@@ -255,6 +312,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-eval-batches", type=int, default=0, help="Debug: limit valid/test batches")
     parser.add_argument("--eval-only", action="store_true", help="Only evaluate checkpoint on valid and test")
     parser.add_argument("--checkpoint", type=str, default="", help="Path to checkpoint for eval-only or resume")
+    parser.add_argument("--distributed", action="store_true", help="Enable DDP training (recommended with torchrun)")
+    parser.add_argument("--dist-backend", type=str, default="nccl", help="DDP backend, e.g. nccl/gloo")
     return parser.parse_args()
 
 
@@ -269,12 +328,21 @@ def run_for_model(
     valid_size: int,
     test_size: int,
     device: torch.device,
+    distributed: bool,
+    rank: int,
 ) -> Dict[str, object]:
     # 每个模型单独写入 result/classification/<model_name> 目录，避免互相覆盖。
     output_dir = Path(args.output_dir) / model_name
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process(rank):
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     model = make_model(arch=model_name, num_classes=10, pretrained=args.pretrained).to(device)
+    if distributed:
+        if device.type == "cuda":
+            model = DDP(model, device_ids=[device.index], output_device=device.index)
+        else:
+            model = DDP(model)
+
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -283,7 +351,8 @@ def run_for_model(
     checkpoint_path = args.checkpoint
     if checkpoint_path:
         ckpt = torch.load(checkpoint_path, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
+        target = model.module if isinstance(model, DDP) else model
+        target.load_state_dict(ckpt["model"])
         if "optimizer" in ckpt and not args.eval_only:
             optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
@@ -297,7 +366,8 @@ def run_for_model(
         "model": model_name,
         "args": vars(args),
     }
-    (output_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    if is_main_process(rank):
+        (output_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     if args.eval_only:
         # 仅评估模式：直接读取权重并输出 valid/test 指标。
@@ -308,6 +378,9 @@ def run_for_model(
             optimizer=None,
             device=device,
             use_amp=args.amp,
+            is_distributed=distributed,
+            rank=rank,
+            desc=f"{model_name}-valid",
             max_batches=args.max_eval_batches,
         )
         test_metrics = run_epoch(
@@ -317,11 +390,17 @@ def run_for_model(
             optimizer=None,
             device=device,
             use_amp=args.amp,
+            is_distributed=distributed,
+            rank=rank,
+            desc=f"{model_name}-test",
             max_batches=args.max_eval_batches,
         )
-        per_class = evaluate_per_class(model, test_loader, device, max_batches=args.max_eval_batches)
-        print(f"[{model_name}][eval-only] valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}")
-        print(f"[{model_name}][eval-only] test  loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
+        per_class = evaluate_per_class(
+            model, test_loader, device, is_distributed=distributed, max_batches=args.max_eval_batches
+        )
+        if is_main_process(rank):
+            print(f"[{model_name}][eval-only] valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}")
+            print(f"[{model_name}][eval-only] test  loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
         return {
             "model": model_name,
             "best_valid_acc": valid_metrics["acc"],
@@ -333,6 +412,10 @@ def run_for_model(
 
     for epoch in range(start_epoch, args.epochs + 1):
         # 标准训练循环：train -> valid -> 保存 last/best checkpoint。
+        if distributed:
+            if hasattr(train_loader, "sampler") and isinstance(train_loader.sampler, DistributedSampler):
+                train_loader.sampler.set_epoch(epoch)
+
         train_metrics = run_epoch(
             model,
             train_loader,
@@ -340,6 +423,9 @@ def run_for_model(
             optimizer=optimizer,
             device=device,
             use_amp=args.amp,
+            is_distributed=distributed,
+            rank=rank,
+            desc=f"{model_name}-train e{epoch}",
             max_batches=args.max_train_batches,
         )
         valid_metrics = run_epoch(
@@ -349,32 +435,42 @@ def run_for_model(
             optimizer=None,
             device=device,
             use_amp=args.amp,
+            is_distributed=distributed,
+            rank=rank,
+            desc=f"{model_name}-valid e{epoch}",
             max_batches=args.max_eval_batches,
         )
 
-        print(
-            f"[{model_name}] epoch {epoch:03d} | "
-            f"train loss={train_metrics['loss']:.4f}, acc={train_metrics['acc']:.4f} | "
-            f"valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}"
-        )
+        if is_main_process(rank):
+            print(
+                f"[{model_name}] epoch {epoch:03d} | "
+                f"train loss={train_metrics['loss']:.4f}, acc={train_metrics['acc']:.4f} | "
+                f"valid loss={valid_metrics['loss']:.4f}, acc={valid_metrics['acc']:.4f}"
+            )
 
         ckpt = {
             "epoch": epoch,
-            "model": model.state_dict(),
+            "model": (model.module if isinstance(model, DDP) else model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "best_valid_acc": best_valid_acc,
             "args": vars(args),
             "model_name": model_name,
         }
-        torch.save(ckpt, output_dir / "last.pt")
+        if is_main_process(rank):
+            torch.save(ckpt, output_dir / "last.pt")
 
         if valid_metrics["acc"] > best_valid_acc:
             best_valid_acc = valid_metrics["acc"]
             ckpt["best_valid_acc"] = best_valid_acc
-            torch.save(ckpt, output_dir / "best.pt")
+            if is_main_process(rank):
+                torch.save(ckpt, output_dir / "best.pt")
+
+        if distributed:
+            dist.barrier()
 
     best_ckpt = torch.load(output_dir / "best.pt", map_location="cpu")
-    model.load_state_dict(best_ckpt["model"])
+    target = model.module if isinstance(model, DDP) else model
+    target.load_state_dict(best_ckpt["model"])
     test_metrics = run_epoch(
         model,
         test_loader,
@@ -382,12 +478,16 @@ def run_for_model(
         optimizer=None,
         device=device,
         use_amp=args.amp,
+        is_distributed=distributed,
+        rank=rank,
+        desc=f"{model_name}-test",
         max_batches=args.max_eval_batches,
     )
-    per_class = evaluate_per_class(model, test_loader, device, max_batches=args.max_eval_batches)
+    per_class = evaluate_per_class(model, test_loader, device, is_distributed=distributed, max_batches=args.max_eval_batches)
 
-    print(f"[{model_name}][final] best valid acc={best_valid_acc:.4f}")
-    print(f"[{model_name}][final] test loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
+    if is_main_process(rank):
+        print(f"[{model_name}][final] best valid acc={best_valid_acc:.4f}")
+        print(f"[{model_name}][final] test loss={test_metrics['loss']:.4f}, acc={test_metrics['acc']:.4f}")
     return {
         "model": model_name,
         "best_valid_acc": best_valid_acc,
@@ -401,10 +501,12 @@ def run_for_model(
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    distributed, rank, world_size, local_rank = init_distributed(args)
 
     data_root = Path(args.data_root)
     output_root = Path(args.output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    if is_main_process(rank):
+        output_root.mkdir(parents=True, exist_ok=True)
     model_list = parse_models(args.models, args.model)
 
     if len(model_list) > 1 and args.checkpoint:
@@ -416,10 +518,15 @@ def main() -> None:
     valid_ds = HazeLevelDataset(data_root, "valid", eval_tf)
     test_ds = HazeLevelDataset(data_root, "test", eval_tf)
 
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
+    valid_sampler = DistributedSampler(valid_ds, shuffle=False) if distributed else None
+    test_sampler = DistributedSampler(test_ds, shuffle=False) if distributed else None
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
@@ -428,6 +535,7 @@ def main() -> None:
         valid_ds,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=valid_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
@@ -436,12 +544,16 @@ def main() -> None:
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=test_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0,
     )
 
-    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
+    if distributed and args.device == "cuda" and torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
     # 依次运行多个模型并汇总结果。
     summary: List[Dict[str, object]] = []
     for model_name in model_list:
@@ -456,15 +568,21 @@ def main() -> None:
             valid_size=len(valid_ds),
             test_size=len(test_ds),
             device=device,
+            distributed=distributed,
+            rank=rank,
         )
-        summary.append(result)
+        if is_main_process(rank):
+            summary.append(result)
 
     # 汇总多模型结果到 result/classification/summary.json，方便统一比较。
-    (output_root / "summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    print(f"[summary] saved to {output_root / 'summary.json'}")
+    if is_main_process(rank):
+        (output_root / "summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"[summary] saved to {output_root / 'summary.json'}")
+
+    cleanup_distributed(distributed)
 
 
 if __name__ == "__main__":
