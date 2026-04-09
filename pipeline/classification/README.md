@@ -44,6 +44,16 @@
 
 - 每个 epoch 的 train/valid/test 阶段均带有 tqdm 进度条（主进程显示）。
 - 支持 DDP 多卡分布式训练（推荐用 `torchrun` 启动）。
+- 支持早停机制（仅保留 `--early-stop-patience`，判定规则为“验证集 acc 只要高于历史最好即视为提升”）。
+- 当前默认预处理为固定分辨率缩放：`Resize((image_size, image_size))`，避免 batch 尺寸不一致报错。
+
+常用参数（最新）
+----------------
+
+- `--image-size`：输入分辨率（默认 `224`）
+- `--early-stop-patience`：早停耐心轮数，`0` 表示关闭
+- `--distributed`：开启 DDP
+- `--dist-backend`：分布式后端（默认 `nccl`）
 
 单模型训练（单卡）
 ------------------
@@ -53,12 +63,13 @@
   --model resnet50 \
   --data-root datasets \
   --output-dir result/classification \
-  --epochs 10 \
+  --epochs 30 \
   --batch-size 64 \
   --num-workers 4 \
   --device cuda \
   --pretrained \
-  --amp
+  --amp \
+  --early-stop-patience 3
 ```
 
 多模型顺序训练（单卡）
@@ -69,19 +80,20 @@
   --models resnet18,resnet50,swin_t,vit_b_16 \
   --data-root datasets \
   --output-dir result/classification \
-  --epochs 10 \
+  --epochs 30 \
   --batch-size 32 \
   --num-workers 4 \
   --device cuda \
   --pretrained \
-  --amp
+  --amp \
+  --early-stop-patience 3
 ```
 
 DDP 多卡训练（单模型示例）
 -------------------------
 
 ```bash
-torchrun --nproc_per_node=4 pipeline/classification/train.py \
+OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 pipeline/classification/train.py \
   --distributed \
   --dist-backend nccl \
   --model resnet18 \
@@ -92,14 +104,15 @@ torchrun --nproc_per_node=4 pipeline/classification/train.py \
   --num-workers 8 \
   --device cuda \
   --pretrained \
-  --amp
+  --amp \
+  --early-stop-patience 3
 ```
 
 DDP 多卡训练（多模型示例）
 -------------------------
 
 ```bash
-torchrun --nproc_per_node=4 pipeline/classification/train.py \
+OMP_NUM_THREADS=8 torchrun --nproc_per_node=4 pipeline/classification/train.py \
   --distributed \
   --dist-backend nccl \
   --models resnet18,resnet50,vit_b_16,swin_t \
@@ -110,7 +123,8 @@ torchrun --nproc_per_node=4 pipeline/classification/train.py \
   --num-workers 8 \
   --device cuda \
   --pretrained \
-  --amp
+  --amp \
+  --early-stop-patience 3
 ```
 
 快速冒烟测试

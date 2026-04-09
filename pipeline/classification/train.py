@@ -60,9 +60,19 @@ def init_distributed(args: argparse.Namespace) -> Tuple[bool, int, int, int]:
 
     if torch.cuda.is_available() and args.device == "cuda":
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend=args.dist_backend)
+        # 新版 PyTorch 支持在 init_process_group 指定 device_id，可避免后续 barrier 设备告警。
+        try:
+            dist.init_process_group(
+                backend=args.dist_backend,
+                rank=rank,
+                world_size=world_size,
+                device_id=local_rank,
+            )
+        except TypeError:
+            # 兼容旧版 PyTorch（无 device_id 参数）。
+            dist.init_process_group(backend=args.dist_backend, rank=rank, world_size=world_size)
     else:
-        dist.init_process_group(backend="gloo")
+        dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
 
     return True, rank, world_size, local_rank
 
@@ -74,6 +84,16 @@ def cleanup_distributed(is_distributed: bool) -> None:
 
 def is_main_process(rank: int) -> bool:
     return rank == 0
+
+
+def distributed_barrier(is_distributed: bool, device: torch.device) -> None:
+    """带设备上下文的 barrier，减少 NCCL 下的设备选择告警。"""
+    if not is_distributed:
+        return
+    if dist.get_backend() == "nccl" and device.type == "cuda" and device.index is not None:
+        dist.barrier(device_ids=[device.index])
+    else:
+        dist.barrier()
 
 
 def extract_beta_idx_from_name(path: Path) -> int:
@@ -475,8 +495,7 @@ def run_for_model(
         else:
             no_improve_epochs += 1
 
-        if distributed:
-            dist.barrier()
+        distributed_barrier(distributed, device)
 
         if args.early_stop_patience > 0 and no_improve_epochs >= args.early_stop_patience:
             if is_main_process(rank):
@@ -485,8 +504,7 @@ def run_for_model(
                     f"best valid acc={best_valid_acc:.4f}, "
                     f"no_improve_epochs={no_improve_epochs}"
                 )
-            if distributed:
-                dist.barrier()
+            distributed_barrier(distributed, device)
             break
 
     best_ckpt = torch.load(output_dir / "best.pt", map_location="cpu")
