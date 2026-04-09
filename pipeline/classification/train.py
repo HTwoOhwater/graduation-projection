@@ -310,6 +310,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision on CUDA")
     parser.add_argument("--max-train-batches", type=int, default=0, help="Debug: limit train batches per epoch")
     parser.add_argument("--max-eval-batches", type=int, default=0, help="Debug: limit valid/test batches")
+    parser.add_argument("--early-stop-patience", type=int, default=0, help="Early stopping patience on valid acc (0 disables)")
     parser.add_argument("--eval-only", action="store_true", help="Only evaluate checkpoint on valid and test")
     parser.add_argument("--checkpoint", type=str, default="", help="Path to checkpoint for eval-only or resume")
     parser.add_argument("--distributed", action="store_true", help="Enable DDP training (recommended with torchrun)")
@@ -348,6 +349,7 @@ def run_for_model(
 
     start_epoch = 1
     best_valid_acc = -1.0
+    no_improve_epochs = 0
     checkpoint_path = args.checkpoint
     if checkpoint_path:
         ckpt = torch.load(checkpoint_path, map_location="cpu")
@@ -357,6 +359,7 @@ def run_for_model(
             optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_valid_acc = float(ckpt.get("best_valid_acc", -1.0))
+        no_improve_epochs = int(ckpt.get("no_improve_epochs", 0))
 
     # 记录当前模型运行参数，便于论文复现实验。
     meta = {
@@ -453,20 +456,38 @@ def run_for_model(
             "model": (model.module if isinstance(model, DDP) else model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "best_valid_acc": best_valid_acc,
+            "no_improve_epochs": no_improve_epochs,
             "args": vars(args),
             "model_name": model_name,
         }
         if is_main_process(rank):
             torch.save(ckpt, output_dir / "last.pt")
 
-        if valid_metrics["acc"] > best_valid_acc:
+        # 简化规则：验证集精度只要高于历史最好值，就视为有提升。
+        improved = valid_metrics["acc"] > best_valid_acc
+        if improved:
             best_valid_acc = valid_metrics["acc"]
             ckpt["best_valid_acc"] = best_valid_acc
+            no_improve_epochs = 0
+            ckpt["no_improve_epochs"] = no_improve_epochs
             if is_main_process(rank):
                 torch.save(ckpt, output_dir / "best.pt")
+        else:
+            no_improve_epochs += 1
 
         if distributed:
             dist.barrier()
+
+        if args.early_stop_patience > 0 and no_improve_epochs >= args.early_stop_patience:
+            if is_main_process(rank):
+                print(
+                    f"[{model_name}] early stopping at epoch {epoch:03d} | "
+                    f"best valid acc={best_valid_acc:.4f}, "
+                    f"no_improve_epochs={no_improve_epochs}"
+                )
+            if distributed:
+                dist.barrier()
+            break
 
     best_ckpt = torch.load(output_dir / "best.pt", map_location="cpu")
     target = model.module if isinstance(model, DDP) else model
