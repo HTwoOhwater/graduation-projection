@@ -85,16 +85,17 @@ def make_transforms(image_size: int) -> Tuple[transforms.Compose, transforms.Com
     # 轻量增强，避免破坏雾霾浓度标签语义。
     train_tf = transforms.Compose(
         [
-            transforms.RandomResizedCrop(image_size, scale=(0.85, 1.0)),
+            # transforms.RandomResizedCrop(image_size, scale=(0.85, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
     eval_tf = transforms.Compose(
         [
-            transforms.Resize(int(image_size * 1.14)),
-            transforms.CenterCrop(image_size),
+            # transforms.Resize(int(image_size * 1.14)),
+            # transforms.CenterCrop(image_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
