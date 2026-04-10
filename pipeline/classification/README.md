@@ -18,9 +18,10 @@
 
 图像文件名需满足以下后缀格式：
 
-`{original_name}_{A_index}_{beta_index}.jpg`
+`{original_name}_{beta_index}_{A_index}.jpg`
 
 其中 `beta_index` 取值为 `[0, 9]`，作为最终分类标签。
+训练脚本同时兼容旧命名 `{original_name}_{A_index}_{beta_index}.jpg`。
 
 数据目录结构
 ------------

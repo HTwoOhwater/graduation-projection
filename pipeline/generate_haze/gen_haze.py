@@ -341,7 +341,7 @@ def _process_pair_worker(task: Dict[str, Any]) -> Dict[str, Any]:
         tinted = apply_tint(rgb, A, tint)
         haze = generate_haze(tinted, depth, beta, A)
 
-        out_path = out_dir / f"{stem}_{a_idx}_{b_idx}.{ext}"
+        out_path = out_dir / f"{stem}_{b_idx}_{a_idx}.{ext}"
         Image.fromarray(haze).save(str(out_path))
         saved += 1
 
@@ -526,8 +526,8 @@ def build_split_offline(
                 tinted = apply_tint(rgb, A, tint)
                 haze = generate_haze(tinted, depth, beta, A)
 
-                # 命名规则保持不变：{original_name}_{A_index}_{beta_index}
-                out_path = out_dir / f"{stem}_{a_idx}_{b_idx}.{ext}"
+                # 命名规则：{original_name}_{beta_index}_{A_index}
+                out_path = out_dir / f"{stem}_{b_idx}_{a_idx}.{ext}"
                 Image.fromarray(haze).save(str(out_path))
                 total_saved += 1
 

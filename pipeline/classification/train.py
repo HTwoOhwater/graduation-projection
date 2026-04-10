@@ -101,13 +101,18 @@ def extract_labels_from_name(path: Path) -> Tuple[int, int]:
     m = LEVEL_RE.search(path.stem)
     if m is None:
         raise ValueError(f"Cannot parse label from filename: {path.name}")
-    a_idx = int(m.group(1))
-    beta_idx = int(m.group(2))
-    if a_idx < 0:
-        raise ValueError(f"a_index out of expected range (>=0) in {path.name}")
-    if not (0 <= beta_idx <= 9):
-        raise ValueError(f"beta_index out of expected range [0,9] in {path.name}")
-    return a_idx, beta_idx
+    first = int(m.group(1))
+    second = int(m.group(2))
+
+    # 新命名（推荐）：{name}_{beta_index}_{A_index}
+    if 0 <= first <= 9 and second >= 0:
+        return second, first  # a_idx, beta_idx
+
+    # 兼容旧命名：{name}_{A_index}_{beta_index}
+    if first >= 0 and 0 <= second <= 9:
+        return first, second
+
+    raise ValueError(f"Cannot infer (a_idx, beta_idx) from filename: {path.name}")
 
 
 class HazeLevelDataset(Dataset):

@@ -35,7 +35,7 @@ pip install pyyaml
 - 每张原图对所有 beta 完整采样（遍历全部 beta level）
 - 在每个 beta level 上随机抽取 1 个 A 索引（可复现，受 seed 控制）
 - 若 beta 有 10 个，则每张原图生成 10 张雾图
-- 命名格式：`{原图名称}_{A_index}_{beta_index}`
+- 命名格式：`{原图名称}_{beta_index}_{A_index}`
 
 beta 插值（第二方案）
 --------------------
