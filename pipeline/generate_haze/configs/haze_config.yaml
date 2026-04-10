@@ -12,7 +12,8 @@ haze:
     - [150, 165, 190] # twilight bluish light
     - [225, 205, 180] # urban dust haze
   # beta_values 作为插值端点或基础序列，启用插值后将按下面配置重采样。
-  beta_values: [0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
+  # beta_values: [0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
+  beta_values: [0, 0.50]
   beta_interpolation:
     enabled: true
     method: exp
