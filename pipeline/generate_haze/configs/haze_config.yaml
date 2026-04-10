@@ -11,22 +11,28 @@ haze:
     - [200, 215, 240] # morning blue light
     - [150, 165, 190] # twilight bluish light
     - [225, 205, 180] # urban dust haze
+  # beta_values 作为插值端点或基础序列，启用插值后将按下面配置重采样。
   beta_values: [0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
+  beta_interpolation:
+    enabled: true
+    method: exp
+    num_levels: 10
+    curve: 2.0
   tint: 0.01
 
 dataset:
   train:
-    clean_dir: ../../datasets/train/original_images
-    depth_dir: ../../datasets/train/depth_images
+    clean_dir: ../../../datasets/train/original_images
+    depth_dir: ../../../datasets/train/depth_images
     image_exts: [jpg, jpeg, png, bmp, tif, tiff]
     random_combo: true
   valid:
-    clean_dir: ../../datasets/valid/original_images
-    depth_dir: ../../datasets/valid/depth_images
+    clean_dir: ../../../datasets/valid/original_images
+    depth_dir: ../../../datasets/valid/depth_images
     image_exts: [jpg, jpeg, png, bmp, tif, tiff]
     random_combo: false
   test:
-    clean_dir: ../../datasets/test/original_images
-    depth_dir: ../../datasets/test/depth_images
+    clean_dir: ../../../datasets/test/original_images
+    depth_dir: ../../../datasets/test/depth_images
     image_exts: [jpg, jpeg, png, bmp, tif, tiff]
     random_combo: false

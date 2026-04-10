@@ -8,6 +8,7 @@ import csv
 import os
 import random
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -130,6 +131,42 @@ def parse_haze_param_grid(config: Dict[str, Any]) -> Dict[str, Any]:
     a_values = [parse_A(a) for a in a_values_raw]
     beta_values = [float(b) for b in beta_values_raw]
 
+    # 第二种方案：对 beta 做指数插值，使雾浓度在观感上更均匀。
+    # 约定配置：
+    # haze:
+    #   beta_interpolation:
+    #     enabled: true
+    #     method: exp
+    #     num_levels: 10
+    #     curve: 2.0
+    beta_interp_cfg = haze_cfg.get("beta_interpolation", {}) or {}
+    beta_interp_enabled = bool(beta_interp_cfg.get("enabled", False))
+    if beta_interp_enabled:
+        method = str(beta_interp_cfg.get("method", "exp")).lower()
+        num_levels = int(beta_interp_cfg.get("num_levels", len(beta_values)))
+        if num_levels <= 1:
+            raise ValueError("haze.beta_interpolation.num_levels must be > 1")
+        beta_min = float(min(beta_values))
+        beta_max = float(max(beta_values))
+        if beta_max <= beta_min:
+            raise ValueError("beta_values max must be greater than min for interpolation")
+
+        if method == "exp":
+            curve = float(beta_interp_cfg.get("curve", 2.0))
+            xs = np.linspace(0.0, 1.0, num_levels, dtype=np.float32)
+            mapped = (np.exp(curve * xs) - 1.0) / (np.exp(curve) - 1.0)
+            # 强制端点对齐，确保插值严格覆盖 [beta_min, beta_max]。
+            mapped[0] = 0.0
+            mapped[-1] = 1.0
+            beta_values = (beta_min + (beta_max - beta_min) * mapped).astype(np.float32).tolist()
+        elif method == "linear":
+            beta_values = np.linspace(beta_min, beta_max, num_levels, dtype=np.float32).tolist()
+        else:
+            raise ValueError(f"Unsupported beta interpolation method: {method}")
+
+    # 统一排序，确保 beta_idx 与浓度强弱单调一致。
+    beta_values = sorted(float(b) for b in beta_values)
+
     if len(a_values) == 0:
         raise ValueError("haze.A_values is empty")
     if len(beta_values) == 0:
@@ -140,6 +177,22 @@ def parse_haze_param_grid(config: Dict[str, Any]) -> Dict[str, Any]:
         "beta_values": beta_values,
         "tint": tint,
     }
+
+
+def _backup_existing_split_outputs(split_root: Path, hazy_root: Path, meta_path: Path) -> Optional[Path]:
+    """备份现有 split 生成结果，避免覆盖原始雾图数据集。"""
+    if not hazy_root.exists() and not meta_path.exists():
+        return None
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_root = split_root / "backup_haze" / ts
+    backup_root.mkdir(parents=True, exist_ok=True)
+
+    if hazy_root.exists():
+        shutil.move(str(hazy_root), str(backup_root / "haze_images"))
+    if meta_path.exists():
+        shutil.move(str(meta_path), str(backup_root / "haze_metadata.csv"))
+    return backup_root
 
 
 def _iter_files_by_ext(root: Path, exts: Sequence[str]) -> List[Path]:
@@ -308,7 +361,7 @@ def build_split_offline(
     max_pairs: int = 0,
     seed_override: Optional[int] = None,
 ) -> Dict[str, Any]:
-    # 按 split 进行批量离线生成：每张图随机 2 个 A，并遍历全部 beta。
+    # 按 split 批量离线生成：每个 beta 随机抽取 1 个 A（每图共 len(beta) 张）。
     cfg = load_config(config_path)
     cfg_path = Path(cfg["_config_path"])  # already absolute
     split_cfg = cfg.get("dataset", {}).get(split)
@@ -344,6 +397,9 @@ def build_split_offline(
     hazy_root = split_root / "haze_images"
     meta_path = split_root / "haze_metadata.csv"
 
+    # 若已有历史生成结果，先自动备份，保留原始数据集。
+    backup_dir = _backup_existing_split_outputs(split_root, hazy_root, meta_path)
+
     if overwrite and hazy_root.exists():
         shutil.rmtree(hazy_root)
     if overwrite and meta_path.exists():
@@ -355,8 +411,8 @@ def build_split_offline(
     num_a = len(a_values)
     num_b = len(beta_values)
 
-    if num_a < 2:
-        raise ValueError("haze.A_values must contain at least 2 entries for current generation policy")
+    if num_a < 1:
+        raise ValueError("haze.A_values must contain at least 1 entry")
 
     for pair_idx, (img_path, depth_path) in enumerate(pairs):
         rel = img_path.relative_to(clean_dir)
@@ -365,30 +421,31 @@ def build_split_offline(
         out_dir.mkdir(parents=True, exist_ok=True)
         rgb, depth = _load_rgb_and_depth(img_path, depth_path, resize_hw)
 
-        chosen_a_indices = _pick_random_a_indices(pair_idx, num_a, seed, pick_count=2)
-        for a_idx in chosen_a_indices:
+        # 新策略：每个 beta 级别独立随机一个 A，保证每图总计只生成 num_b 张。
+        rng = random.Random(seed + pair_idx * 1000003)
+        for b_idx, beta in enumerate(beta_values):
+            a_idx = rng.randrange(num_a)
             A = a_values[a_idx]
-            for b_idx, beta in enumerate(beta_values):
-                tinted = apply_tint(rgb, A, tint)
-                haze = generate_haze(tinted, depth, beta, A)
+            tinted = apply_tint(rgb, A, tint)
+            haze = generate_haze(tinted, depth, beta, A)
 
-                # 命名规则：{original_name}_{A_index}_{beta_index}
-                out_path = out_dir / f"{stem}_{a_idx}_{b_idx}.{ext}"
-                Image.fromarray(haze).save(str(out_path))
-                total_saved += 1
+            # 命名规则保持不变：{original_name}_{A_index}_{beta_index}
+            out_path = out_dir / f"{stem}_{a_idx}_{b_idx}.{ext}"
+            Image.fromarray(haze).save(str(out_path))
+            total_saved += 1
 
-                rows.append(
-                    {
-                        "split": split,
-                        "output_path": str(out_path),
-                        "clean_path": str(img_path),
-                        "depth_path": str(depth_path),
-                        "a_idx": a_idx,
-                        "beta_idx": b_idx,
-                        "A": "|".join(str(int(round(v))) for v in A.tolist()),
-                        "beta": float(beta),
-                    }
-                )
+            rows.append(
+                {
+                    "split": split,
+                    "output_path": str(out_path),
+                    "clean_path": str(img_path),
+                    "depth_path": str(depth_path),
+                    "a_idx": a_idx,
+                    "beta_idx": b_idx,
+                    "A": "|".join(str(int(round(v))) for v in A.tolist()),
+                    "beta": float(beta),
+                }
+            )
 
     _write_metadata_csv(meta_path, rows)
     return {
@@ -397,8 +454,10 @@ def build_split_offline(
         "images_saved": total_saved,
         "out_dir": str(hazy_root),
         "metadata": str(meta_path),
-        "a_per_image": 2,
+        "a_per_image": 1,
         "betas_per_a": num_b,
+        "beta_values_used": [round(float(b), 6) for b in beta_values],
+        "backup_dir": str(backup_dir) if backup_dir is not None else "",
     }
 
 
@@ -468,10 +527,13 @@ def main() -> None:
             print(
                 f"[{summary['split']}] pairs={summary['pairs']}, "
                 f"saved={summary['images_saved']}, "
-                f"a_per_image={summary['a_per_image']}, betas_per_a={summary['betas_per_a']}"
+                f"a_per_image={summary['a_per_image']}, beta_levels={summary['betas_per_a']}"
             )
             print(f"  out_dir: {summary['out_dir']}")
             print(f"  metadata: {summary['metadata']}")
+            print(f"  beta_values: {summary['beta_values_used']}")
+            if summary.get("backup_dir"):
+                print(f"  backup: {summary['backup_dir']}")
         return
 
 
