@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import os
 import random
@@ -306,6 +307,60 @@ def _write_metadata_csv(csv_path: Path, rows: List[Dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _process_pair_worker(task: Dict[str, Any]) -> Dict[str, Any]:
+    """子进程工作函数：读取一对 clean/depth，遍历全部 beta 并保存雾图。"""
+    # 限制 OpenCV 在线程池/进程池中的线程数，减少过度抢占。
+    cv2.setNumThreads(1)
+
+    pair_idx = int(task["pair_idx"])
+    img_path = Path(task["img_path"])
+    depth_path = Path(task["depth_path"])
+    rel_parent = Path(task["rel_parent"])
+    stem = str(task["stem"])
+    hazy_root = Path(task["hazy_root"])
+    resize_hw = task.get("resize_hw")
+    a_values_raw = task["a_values"]
+    beta_values = [float(x) for x in task["beta_values"]]
+    tint = float(task["tint"])
+    seed = int(task["seed"])
+    ext = str(task["ext"])
+    split = str(task["split"])
+
+    out_dir = hazy_root / rel_parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rgb, depth = _load_rgb_and_depth(img_path, depth_path, resize_hw)
+
+    rows: List[Dict[str, Any]] = []
+    saved = 0
+    rng = random.Random(seed + pair_idx * 1000003)
+    num_a = len(a_values_raw)
+
+    for b_idx, beta in enumerate(beta_values):
+        a_idx = rng.randrange(num_a)
+        A = np.asarray(a_values_raw[a_idx], dtype=np.float32)
+        tinted = apply_tint(rgb, A, tint)
+        haze = generate_haze(tinted, depth, beta, A)
+
+        out_path = out_dir / f"{stem}_{a_idx}_{b_idx}.{ext}"
+        Image.fromarray(haze).save(str(out_path))
+        saved += 1
+
+        rows.append(
+            {
+                "split": split,
+                "output_path": str(out_path),
+                "clean_path": str(img_path),
+                "depth_path": str(depth_path),
+                "a_idx": a_idx,
+                "beta_idx": b_idx,
+                "A": "|".join(str(int(round(v))) for v in A.tolist()),
+                "beta": float(beta),
+            }
+        )
+
+    return {"saved": saved, "rows": rows}
+
+
 def run_single_from_local_dataloader(
     config_path: str,
     img_path: str,
@@ -361,6 +416,7 @@ def build_split_offline(
     overwrite: bool = False,
     max_pairs: int = 0,
     seed_override: Optional[int] = None,
+    num_procs: int = 1,
 ) -> Dict[str, Any]:
     # 按 split 批量离线生成：每个 beta 随机抽取 1 个 A（每图共 len(beta) 张）。
     cfg = load_config(config_path)
@@ -415,44 +471,78 @@ def build_split_offline(
     if num_a < 1:
         raise ValueError("haze.A_values must contain at least 1 entry")
 
-    pair_iter = tqdm(
-        enumerate(pairs),
-        total=len(pairs),
-        desc=f"build-{split}",
-        unit="pair",
-    )
-    for pair_idx, (img_path, depth_path) in pair_iter:
-        rel = img_path.relative_to(clean_dir)
-        stem = rel.stem
-        out_dir = hazy_root / rel.parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        rgb, depth = _load_rgb_and_depth(img_path, depth_path, resize_hw)
+    # 多进程并行：每个进程负责一对样本的读取、合成与写盘。
+    # num_procs<=1 时退化为单进程，方便调试。
+    use_parallel = int(num_procs) > 1
+    a_values_raw = [a.tolist() for a in a_values]
 
-        # 新策略：每个 beta 级别独立随机一个 A，保证每图总计只生成 num_b 张。
-        rng = random.Random(seed + pair_idx * 1000003)
-        for b_idx, beta in enumerate(beta_values):
-            a_idx = rng.randrange(num_a)
-            A = a_values[a_idx]
-            tinted = apply_tint(rgb, A, tint)
-            haze = generate_haze(tinted, depth, beta, A)
-
-            # 命名规则保持不变：{original_name}_{A_index}_{beta_index}
-            out_path = out_dir / f"{stem}_{a_idx}_{b_idx}.{ext}"
-            Image.fromarray(haze).save(str(out_path))
-            total_saved += 1
-
-            rows.append(
+    if use_parallel:
+        tasks: List[Dict[str, Any]] = []
+        for pair_idx, (img_path, depth_path) in enumerate(pairs):
+            rel = img_path.relative_to(clean_dir)
+            tasks.append(
                 {
-                    "split": split,
-                    "output_path": str(out_path),
-                    "clean_path": str(img_path),
+                    "pair_idx": pair_idx,
+                    "img_path": str(img_path),
                     "depth_path": str(depth_path),
-                    "a_idx": a_idx,
-                    "beta_idx": b_idx,
-                    "A": "|".join(str(int(round(v))) for v in A.tolist()),
-                    "beta": float(beta),
+                    "rel_parent": str(rel.parent),
+                    "stem": rel.stem,
+                    "hazy_root": str(hazy_root),
+                    "resize_hw": resize_hw,
+                    "a_values": a_values_raw,
+                    "beta_values": beta_values,
+                    "tint": tint,
+                    "seed": seed,
+                    "ext": ext,
+                    "split": split,
                 }
             )
+
+        with ProcessPoolExecutor(max_workers=int(num_procs)) as ex:
+            futures = [ex.submit(_process_pair_worker, t) for t in tasks]
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=f"build-{split}", unit="pair"):
+                result = fut.result()
+                total_saved += int(result["saved"])
+                rows.extend(result["rows"])
+    else:
+        pair_iter = tqdm(
+            enumerate(pairs),
+            total=len(pairs),
+            desc=f"build-{split}",
+            unit="pair",
+        )
+        for pair_idx, (img_path, depth_path) in pair_iter:
+            rel = img_path.relative_to(clean_dir)
+            stem = rel.stem
+            out_dir = hazy_root / rel.parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            rgb, depth = _load_rgb_and_depth(img_path, depth_path, resize_hw)
+
+            # 新策略：每个 beta 级别独立随机一个 A，保证每图总计只生成 num_b 张。
+            rng = random.Random(seed + pair_idx * 1000003)
+            for b_idx, beta in enumerate(beta_values):
+                a_idx = rng.randrange(num_a)
+                A = a_values[a_idx]
+                tinted = apply_tint(rgb, A, tint)
+                haze = generate_haze(tinted, depth, beta, A)
+
+                # 命名规则保持不变：{original_name}_{A_index}_{beta_index}
+                out_path = out_dir / f"{stem}_{a_idx}_{b_idx}.{ext}"
+                Image.fromarray(haze).save(str(out_path))
+                total_saved += 1
+
+                rows.append(
+                    {
+                        "split": split,
+                        "output_path": str(out_path),
+                        "clean_path": str(img_path),
+                        "depth_path": str(depth_path),
+                        "a_idx": a_idx,
+                        "beta_idx": b_idx,
+                        "A": "|".join(str(int(round(v))) for v in A.tolist()),
+                        "beta": float(beta),
+                    }
+                )
 
     _write_metadata_csv(meta_path, rows)
     return {
@@ -465,6 +555,7 @@ def build_split_offline(
         "betas_per_a": num_b,
         "beta_values_used": [round(float(b), 6) for b in beta_values],
         "backup_dir": str(backup_dir) if backup_dir is not None else "",
+        "num_procs": int(num_procs),
     }
 
 
@@ -492,6 +583,12 @@ def parse_args() -> argparse.Namespace:
     p_build.add_argument("--overwrite", action="store_true", help="Delete output split folder before writing")
     p_build.add_argument("--max-pairs", type=int, default=0, help="Limit number of clean-depth pairs per split (0 means all)")
     p_build.add_argument("--seed", type=int, default=None, help="Optional seed override for random_combo mode")
+    p_build.add_argument(
+        "--num-procs",
+        type=int,
+        default=1,
+        help="Number of worker processes for parallel generation (1 means single process)",
+    )
 
     return parser.parse_args()
 
@@ -530,6 +627,7 @@ def main() -> None:
                 overwrite=args.overwrite,
                 max_pairs=args.max_pairs,
                 seed_override=args.seed,
+                num_procs=args.num_procs,
             )
             print(
                 f"[{summary['split']}] pairs={summary['pairs']}, "
@@ -539,6 +637,7 @@ def main() -> None:
             print(f"  out_dir: {summary['out_dir']}")
             print(f"  metadata: {summary['metadata']}")
             print(f"  beta_values: {summary['beta_values_used']}")
+            print(f"  num_procs: {summary['num_procs']}")
             if summary.get("backup_dir"):
                 print(f"  backup: {summary['backup_dir']}")
         return
