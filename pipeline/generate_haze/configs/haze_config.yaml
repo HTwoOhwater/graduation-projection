@@ -13,13 +13,13 @@ haze:
     - [190, 215, 245] # morning cold-blue haze
   # beta_values 作为插值端点或基础序列，启用插值后将按下面配置重采样。
   # beta_values: [0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
-  beta_values: [0, 0.50]
+  beta_values: [0, 0.40]
   beta_interpolation:
     enabled: true
-    method: exp
+    method: linear
     num_levels: 10
     curve: 2.0
-  tint: 0.01
+  tint: 0.00  # 不混合环境光
 
 dataset:
   train:

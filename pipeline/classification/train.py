@@ -249,6 +249,7 @@ def run_epoch(
     rank: int,
     desc: str,
     loss_a_weight: float,
+    ignore_beta0_for_a: bool,
     max_batches: int = 0,
 ) -> Dict[str, float]:
     # optimizer 为 None 时表示验证/测试阶段。
@@ -260,6 +261,7 @@ def run_epoch(
     total_beta_correct = 0.0
     total_a_correct = 0.0
     total_count = 0
+    total_a_count = 0
 
     iterator = loader
     if is_main_process(rank):
@@ -276,7 +278,15 @@ def run_epoch(
         with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
             beta_logits, a_logits = model(images)
             loss_beta = criterion(beta_logits, beta_labels)
-            loss_a = criterion(a_logits, a_labels)
+            if ignore_beta0_for_a:
+                valid_a_mask = beta_labels > 0
+                if bool(valid_a_mask.any().item()):
+                    loss_a = criterion(a_logits[valid_a_mask], a_labels[valid_a_mask])
+                else:
+                    loss_a = torch.zeros((), device=device, dtype=loss_beta.dtype)
+            else:
+                valid_a_mask = torch.ones_like(beta_labels, dtype=torch.bool)
+                loss_a = criterion(a_logits, a_labels)
             loss = loss_beta + loss_a_weight * loss_a
 
         if train_mode:
@@ -289,20 +299,26 @@ def run_epoch(
         bs = beta_labels.size(0)
         total_loss += loss.item() * bs
         total_beta_correct += float((torch.argmax(beta_logits, dim=1) == beta_labels).sum().item())
-        total_a_correct += float((torch.argmax(a_logits, dim=1) == a_labels).sum().item())
+        if bool(valid_a_mask.any().item()):
+            total_a_correct += float((torch.argmax(a_logits[valid_a_mask], dim=1) == a_labels[valid_a_mask]).sum().item())
+            total_a_count += int(valid_a_mask.sum().item())
         total_count += bs
 
     if is_distributed:
-        stat = torch.tensor([total_loss, total_beta_correct, total_a_correct, float(total_count)], device=device)
+        stat = torch.tensor(
+            [total_loss, total_beta_correct, total_a_correct, float(total_count), float(total_a_count)],
+            device=device,
+        )
         dist.all_reduce(stat, op=dist.ReduceOp.SUM)
-        total_loss, total_beta_correct, total_a_correct, total_count = stat.tolist()
+        total_loss, total_beta_correct, total_a_correct, total_count, total_a_count = stat.tolist()
 
     if total_count == 0:
         return {"loss": 0.0, "beta_acc": 0.0, "a_acc": 0.0}
+    a_acc = 0.0 if total_a_count == 0 else (total_a_correct / total_a_count)
     return {
         "loss": total_loss / total_count,
         "beta_acc": total_beta_correct / total_count,
-        "a_acc": total_a_correct / total_count,
+        "a_acc": a_acc,
     }
 
 
@@ -313,6 +329,7 @@ def evaluate_per_class(
     is_distributed: bool,
     target: str,
     num_classes: int,
+    ignore_beta0_for_a: bool = True,
     max_batches: int = 0,
 ) -> Dict[str, float]:
     # 计算每个类别的独立准确率（target=beta 或 a）。
@@ -328,8 +345,18 @@ def evaluate_per_class(
             a_labels = a_labels.to(device, non_blocking=True)
             beta_labels = beta_labels.to(device, non_blocking=True)
             beta_logits, a_logits = model(images)
-            labels = beta_labels if target == "beta" else a_labels
-            logits = beta_logits if target == "beta" else a_logits
+            if target == "beta":
+                labels = beta_labels
+                logits = beta_logits
+            else:
+                labels = a_labels
+                logits = a_logits
+                if ignore_beta0_for_a:
+                    valid_a_mask = beta_labels > 0
+                    if not bool(valid_a_mask.any().item()):
+                        continue
+                    labels = labels[valid_a_mask]
+                    logits = logits[valid_a_mask]
             preds = torch.argmax(logits, dim=1)
             for cls in range(num_classes):
                 mask = labels == cls
@@ -383,6 +410,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta-classes", type=int, default=10, help="Number of beta classes")
     parser.add_argument("--a-classes", type=int, default=6, help="Number of A classes")
     parser.add_argument("--loss-a-weight", type=float, default=0.5, help="Loss weight for A head in dual-head training")
+    parser.add_argument(
+        "--include-beta0-in-a-loss",
+        action="store_true",
+        help="Include beta=0 samples in A-head loss/metrics (default: excluded)",
+    )
     parser.add_argument("--eval-only", action="store_true", help="Only evaluate checkpoint on valid and test")
     parser.add_argument("--checkpoint", type=str, default="", help="Path to checkpoint for eval-only or resume")
     parser.add_argument("--distributed", action="store_true", help="Enable DDP training (recommended with torchrun)")
@@ -462,6 +494,7 @@ def run_for_model(
             rank=rank,
             desc=f"{model_name}-valid",
             loss_a_weight=args.loss_a_weight,
+            ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_eval_batches,
         )
         test_metrics = run_epoch(
@@ -475,6 +508,7 @@ def run_for_model(
             rank=rank,
             desc=f"{model_name}-test",
             loss_a_weight=args.loss_a_weight,
+            ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_eval_batches,
         )
         per_class_beta = evaluate_per_class(
@@ -493,6 +527,7 @@ def run_for_model(
             is_distributed=distributed,
             target="a",
             num_classes=args.a_classes,
+            ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_eval_batches,
         )
         if is_main_process(rank):
@@ -532,6 +567,7 @@ def run_for_model(
             rank=rank,
             desc=f"{model_name}-train e{epoch}",
             loss_a_weight=args.loss_a_weight,
+            ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_train_batches,
         )
         valid_metrics = run_epoch(
@@ -545,6 +581,7 @@ def run_for_model(
             rank=rank,
             desc=f"{model_name}-valid e{epoch}",
             loss_a_weight=args.loss_a_weight,
+            ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_eval_batches,
         )
 
@@ -605,6 +642,7 @@ def run_for_model(
         rank=rank,
         desc=f"{model_name}-test",
         loss_a_weight=args.loss_a_weight,
+        ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
         max_batches=args.max_eval_batches,
     )
     per_class_beta = evaluate_per_class(
@@ -623,6 +661,7 @@ def run_for_model(
         is_distributed=distributed,
         target="a",
         num_classes=args.a_classes,
+        ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
         max_batches=args.max_eval_batches,
     )
 

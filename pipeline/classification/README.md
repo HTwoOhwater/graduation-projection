@@ -47,6 +47,7 @@
 - 支持 DDP 多卡分布式训练（推荐用 `torchrun` 启动）。
 - 支持早停机制（仅保留 `--early-stop-patience`，判定规则为“验证集 acc 只要高于历史最好即视为提升”）。
 - 当前默认预处理为固定分辨率缩放：`Resize((image_size, image_size))`，避免 batch 尺寸不一致报错。
+- 默认会在 `beta=0` 样本上屏蔽 A 头损失与 A 头评估（因为该情况下 A 不可辨识）；如需包含可加 `--include-beta0-in-a-loss`。
 
 常用参数（最新）
 ----------------
@@ -55,13 +56,14 @@
 - `--early-stop-patience`：早停耐心轮数，`0` 表示关闭
 - `--distributed`：开启 DDP
 - `--dist-backend`：分布式后端（默认 `nccl`）
+- `--include-beta0-in-a-loss`：将 `beta=0` 样本纳入 A 头损失/评估（默认关闭）
 
 单模型训练（单卡）
 ------------------
 
 ```bash
 .venv/bin/python pipeline/classification/train.py \
-  --model resnet50 \
+  --model resnet18 \
   --data-root datasets \
   --output-dir result/classification \
   --epochs 30 \
