@@ -248,6 +248,7 @@ def run_epoch(
     is_distributed: bool,
     rank: int,
     desc: str,
+    task_mode: str,
     loss_a_weight: float,
     ignore_beta0_for_a: bool,
     max_batches: int = 0,
@@ -278,7 +279,10 @@ def run_epoch(
         with torch.amp.autocast("cuda", enabled=(use_amp and device.type == "cuda")):
             beta_logits, a_logits = model(images)
             loss_beta = criterion(beta_logits, beta_labels)
-            if ignore_beta0_for_a:
+            if task_mode == "beta":
+                valid_a_mask = torch.zeros_like(beta_labels, dtype=torch.bool)
+                loss_a = torch.zeros((), device=device, dtype=loss_beta.dtype)
+            elif ignore_beta0_for_a:
                 valid_a_mask = beta_labels > 0
                 if bool(valid_a_mask.any().item()):
                     loss_a = criterion(a_logits[valid_a_mask], a_labels[valid_a_mask])
@@ -314,7 +318,10 @@ def run_epoch(
 
     if total_count == 0:
         return {"loss": 0.0, "beta_acc": 0.0, "a_acc": 0.0}
-    a_acc = 0.0 if total_a_count == 0 else (total_a_correct / total_a_count)
+    if task_mode == "beta":
+        a_acc = -1.0
+    else:
+        a_acc = 0.0 if total_a_count == 0 else (total_a_correct / total_a_count)
     return {
         "loss": total_loss / total_count,
         "beta_acc": total_beta_correct / total_count,
@@ -329,10 +336,14 @@ def evaluate_per_class(
     is_distributed: bool,
     target: str,
     num_classes: int,
+    task_mode: str,
     ignore_beta0_for_a: bool = True,
     max_batches: int = 0,
 ) -> Dict[str, float]:
     # 计算每个类别的独立准确率（target=beta 或 a）。
+    if task_mode == "beta" and target == "a":
+        return {f"class_{cls}": -1.0 for cls in range(num_classes)}
+
     model.eval()
     correct = [0 for _ in range(num_classes)]
     total = [0 for _ in range(num_classes)]
@@ -404,6 +415,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda", help="cuda or cpu")
     parser.add_argument("--pretrained", action="store_true", help="Use ImageNet pretrained weights")
     parser.add_argument("--amp", action="store_true", help="Enable mixed precision on CUDA")
+    parser.add_argument(
+        "--task-mode",
+        type=str,
+        default="dual",
+        choices=["dual", "beta"],
+        help="Training target mode: dual(beta+A) or beta(beta-only)",
+    )
     parser.add_argument("--max-train-batches", type=int, default=0, help="Debug: limit train batches per epoch")
     parser.add_argument("--max-eval-batches", type=int, default=0, help="Debug: limit valid/test batches")
     parser.add_argument("--early-stop-patience", type=int, default=0, help="Early stopping patience on valid acc (0 disables)")
@@ -493,6 +511,7 @@ def run_for_model(
             is_distributed=distributed,
             rank=rank,
             desc=f"{model_name}-valid",
+            task_mode=args.task_mode,
             loss_a_weight=args.loss_a_weight,
             ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_eval_batches,
@@ -507,6 +526,7 @@ def run_for_model(
             is_distributed=distributed,
             rank=rank,
             desc=f"{model_name}-test",
+            task_mode=args.task_mode,
             loss_a_weight=args.loss_a_weight,
             ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_eval_batches,
@@ -518,6 +538,7 @@ def run_for_model(
             is_distributed=distributed,
             target="beta",
             num_classes=args.beta_classes,
+            task_mode=args.task_mode,
             max_batches=args.max_eval_batches,
         )
         per_class_a = evaluate_per_class(
@@ -527,6 +548,7 @@ def run_for_model(
             is_distributed=distributed,
             target="a",
             num_classes=args.a_classes,
+            task_mode=args.task_mode,
             ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_eval_batches,
         )
@@ -566,6 +588,7 @@ def run_for_model(
             is_distributed=distributed,
             rank=rank,
             desc=f"{model_name}-train e{epoch}",
+            task_mode=args.task_mode,
             loss_a_weight=args.loss_a_weight,
             ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_train_batches,
@@ -580,6 +603,7 @@ def run_for_model(
             is_distributed=distributed,
             rank=rank,
             desc=f"{model_name}-valid e{epoch}",
+            task_mode=args.task_mode,
             loss_a_weight=args.loss_a_weight,
             ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
             max_batches=args.max_eval_batches,
@@ -641,6 +665,7 @@ def run_for_model(
         is_distributed=distributed,
         rank=rank,
         desc=f"{model_name}-test",
+        task_mode=args.task_mode,
         loss_a_weight=args.loss_a_weight,
         ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
         max_batches=args.max_eval_batches,
@@ -652,6 +677,7 @@ def run_for_model(
         is_distributed=distributed,
         target="beta",
         num_classes=args.beta_classes,
+        task_mode=args.task_mode,
         max_batches=args.max_eval_batches,
     )
     per_class_a = evaluate_per_class(
@@ -661,6 +687,7 @@ def run_for_model(
         is_distributed=distributed,
         target="a",
         num_classes=args.a_classes,
+        task_mode=args.task_mode,
         ignore_beta0_for_a=(not args.include_beta0_in_a_loss),
         max_batches=args.max_eval_batches,
     )
