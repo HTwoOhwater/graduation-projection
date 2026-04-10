@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import yaml
 from PIL import Image
+from tqdm.auto import tqdm
 
 
 def normalize_to_01(arr: np.ndarray) -> np.ndarray:
@@ -414,7 +415,13 @@ def build_split_offline(
     if num_a < 1:
         raise ValueError("haze.A_values must contain at least 1 entry")
 
-    for pair_idx, (img_path, depth_path) in enumerate(pairs):
+    pair_iter = tqdm(
+        enumerate(pairs),
+        total=len(pairs),
+        desc=f"build-{split}",
+        unit="pair",
+    )
+    for pair_idx, (img_path, depth_path) in pair_iter:
         rel = img_path.relative_to(clean_dir)
         stem = rel.stem
         out_dir = hazy_root / rel.parent

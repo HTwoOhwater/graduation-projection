@@ -5,12 +5,12 @@ output:
 
 haze:
   A_values:
-    - [235, 225, 210] # bright noon haze
+    - [245, 238, 225] # bright noon neutral haze
+    - [255, 228, 190] # golden warm haze
+    - [210, 185, 155] # urban dust warm haze
     - [175, 180, 190] # dense gray fog
-    - [255, 210, 170] # golden hour warm light
-    - [200, 215, 240] # morning blue light
-    - [150, 165, 190] # twilight bluish light
-    - [225, 205, 180] # urban dust haze
+    - [135, 150, 180] # twilight cool haze
+    - [190, 215, 245] # morning cold-blue haze
   # beta_values 作为插值端点或基础序列，启用插值后将按下面配置重采样。
   # beta_values: [0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45]
   beta_values: [0, 0.50]
