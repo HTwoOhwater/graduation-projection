@@ -233,6 +233,19 @@ def parse_models(spec: str, fallback_model: str) -> List[str]:
     return names
 
 
+def allocate_unique_output_dir(base_dir: Path) -> Path:
+    """Return a non-existing directory path by appending numeric suffix when needed."""
+    if not base_dir.exists():
+        return base_dir
+
+    idx = 1
+    while True:
+        candidate = base_dir.parent / f"{base_dir.name}_{idx}"
+        if not candidate.exists():
+            return candidate
+        idx += 1
+
+
 def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     preds = torch.argmax(logits, dim=1)
     return (preds == targets).float().mean().item()
@@ -454,10 +467,19 @@ def run_for_model(
     distributed: bool,
     rank: int,
 ) -> Dict[str, object]:
-    # 每个模型单独写入 result/classification/<model_name> 目录，避免互相覆盖。
-    output_dir = Path(args.output_dir) / model_name
-    if is_main_process(rank):
-        output_dir.mkdir(parents=True, exist_ok=True)
+    # 每个模型单独写入目录；若同名目录已存在，则自动追加数字后缀避免覆盖。
+    base_output_dir = Path(args.output_dir) / model_name
+    if distributed:
+        out_dir_holder = [""]
+        if is_main_process(rank):
+            chosen_dir = allocate_unique_output_dir(base_output_dir)
+            chosen_dir.mkdir(parents=True, exist_ok=False)
+            out_dir_holder[0] = str(chosen_dir)
+        dist.broadcast_object_list(out_dir_holder, src=0)
+        output_dir = Path(out_dir_holder[0])
+    else:
+        output_dir = allocate_unique_output_dir(base_output_dir)
+        output_dir.mkdir(parents=True, exist_ok=False)
 
     model = make_model(
         arch=model_name,

@@ -1,10 +1,71 @@
-datasets
-archieve
-algorithm
-PPT
-__pycache__
-__MACOSX
-out
-result
-.venv
-.vscode
+# Project data and outputs
+datasets/
+result/
+out/
+archieve/
+PPT/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments and local tooling
+.venv/
+.python-version
+.vscode/
+.idea/
+
+# OS / packaging noise
+.DS_Store
+Thumbs.db
+__MACOSX/
+
+# Logs and experiment artifacts
+*.log
+events.out.tfevents.*
+runs/
+logs/
+outputs/
+checkpoints/
+ckpt/
+wdb/
+wandb/
+
+# Model weights and large binaries
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.onnx
+*.safetensors
+*.pdparams
+*.pdopt
+*.h5
+*.npz
+
+# Nested cloned repositories under algorithm/
+algorithm/**/.git/
+
+# Common cache / build dirs inside algorithm projects
+algorithm/**/__pycache__/
+algorithm/**/*.py[cod]
+algorithm/**/build/
+algorithm/**/dist/
+algorithm/**/.pytest_cache/
+algorithm/**/.mypy_cache/
+algorithm/**/.ruff_cache/
+algorithm/**/.cache/
+
+# Training outputs inside algorithm projects
+algorithm/**/results/
+algorithm/**/result/
+algorithm/**/outputs/
+algorithm/**/runs/
+algorithm/**/logs/
+algorithm/**/ckpt/
+algorithm/**/checkpoint/
+algorithm/**/checkpoints/
+algorithm/**/pretrained/
+algorithm/**/premodel/
