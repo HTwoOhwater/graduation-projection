@@ -222,8 +222,11 @@ class Trainer(object):
                 if self.condition:
                     file_ = items["B_paths"][0]
                     file_name = file_.split('/')[-3]
+                    lq_path = items["A_paths"][0]
+                    output_name = os.path.basename(lq_path).replace('_fake_B', '')
                 else:
                     file_name = f'{i}.png'
+                    output_name = file_name
 
                 i += 1
 
@@ -295,7 +298,7 @@ class Trainer(object):
                     nrow = all_images.shape[0]
                 save_path = str(self.results_folder / file_name)
                 os.makedirs(save_path, exist_ok=True)
-                full_path = os.path.join(save_path, file_.split('/')[-1]).replace('_fake_B', '')
+                full_path = os.path.join(save_path, output_name)
                 utils.save_image(all_images, full_path, nrow=nrow)
                 print("test-save "+full_path)
 

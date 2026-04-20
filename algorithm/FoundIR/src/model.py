@@ -17,8 +17,13 @@ import torch.nn.functional as F
 from einops import rearrange, reduce
 from torch import einsum, nn
 from torch.optim import RAdam
-from thop import profile
 import importlib
+from tqdm.auto import tqdm
+
+try:
+    from thop import profile
+except ImportError:
+    profile = None
 
 from src.utils import (
     default,
