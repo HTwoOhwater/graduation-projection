@@ -1,6 +1,18 @@
+"""FoundIR 推理入口。
+
+这一层只负责：
+1. 解析推理参数
+2. 构建数据集
+3. 构建模型与扩散器
+4. 调用 Trainer.test()
+
+这样布局的核心原因是：推理行为应当由显式参数驱动，而不是靠手改脚本。
+"""
+
 import argparse
 from data.combined_dataset import CombinedDataset
-from src.model import ResidualDiffusion, Trainer, UnetRes, set_seed
+from src.model import ResidualDiffusion, UnetRes, set_seed
+from src.trainer import Trainer
 
 
 def parse_args():
@@ -38,6 +50,7 @@ def parse_args():
 
 
 def build_dataset(args):
+    # 测试入口和训练入口共用同一个数据类，保证数据读取语义一致。
     return CombinedDataset(
         args,
         args.image_size,
@@ -53,6 +66,7 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    # 推理入口的结构尽量和训练入口保持一致，减少后续维护心智负担。
     dataset = build_dataset(args)
     num_unet = 1
     condition = True
@@ -79,6 +93,7 @@ def main():
         test_res_or_noise=args.test_res_or_noise,
     )
 
+    # checkpoint_dir 只表示权重来源；output_dir 单独控制输出位置，避免语义混淆。
     trainer = Trainer(
         diffusion,
         dataset,

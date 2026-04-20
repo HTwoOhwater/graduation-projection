@@ -1,5 +1,14 @@
+"""FoundIR 训练入口。
+
+当前布局刻意把“训练入口参数解析”和“模型/数据构建”放在这一层，
+而不是散落到 model 或 trainer 里。
+这样做的目的是把“实验配置”留在入口，把“算法实现”留在内部模块，
+后续你切换数据集、checkpoint 路径或训练超参数时，不需要反复改底层代码。
+"""
+
 import argparse
-from src.model import ResidualDiffusion, Trainer, UnetRes, set_seed
+from src.model import ResidualDiffusion, UnetRes, set_seed
+from src.trainer import Trainer
 from data.combined_dataset import CombinedDataset
 
 
@@ -38,6 +47,7 @@ def parse_args():
 
 
 def build_dataset(args):
+    # 数据构建单独封装，便于以后替换成你自己的 dataset 类或别的数据模式。
     return CombinedDataset(
         args,
         args.image_size,
@@ -53,10 +63,12 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    # 入口层只负责“组装对象”，不直接写训练细节。
     dataset = build_dataset(args)
     num_unet = 1
     condition = True
 
+    # 主干网络与扩散过程分开实例化，方便你之后单独替换 backbone 或 diffusion 配置。
     model = UnetRes(
         dim=64,
         dim_mults=(1, 2, 4, 8),
@@ -79,6 +91,7 @@ def main():
         test_res_or_noise=args.test_res_or_noise,
     )
 
+    # Trainer 负责训练调度，不再和模型定义混在一个文件里。
     trainer = Trainer(
         diffusion,
         dataset,

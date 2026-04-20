@@ -1,3 +1,13 @@
+"""FoundIR 的配对数据集实现。
+
+这里保留两种最常用的数据组织方式：
+1. `paired`：目录下直接有 `LQ/` 和 `GT/`
+2. `meta_info`：由 meta 文件显式指定配对关系
+
+把数据逻辑集中在这里的意义是：后续你换数据、换配对方式时，
+只需要在 dataset 层改，不需要碰训练器和模型主体。
+"""
+
 import os
 from os import path as osp
 from pathlib import Path
@@ -53,9 +63,11 @@ class CombinedDataset(BaseDataset):
         self.generation = generation
         self.image_size = image_size
         self.opt = opt
+        # task 显式表示“这份数据是怎么组织的”，避免行为依赖文件夹命名或脚本注释。
         self.task = task or 'paired'
 
         if self.task == 'paired':
+            # 最朴素的配对模式：直接从 LQ/GT 两个目录读取。
             self.dir_LQ = os.path.join(opt.dataroot, 'LQ')
             self.dir_GT = os.path.join(opt.dataroot, 'GT')
 
@@ -64,6 +76,7 @@ class CombinedDataset(BaseDataset):
         elif self.task == 'meta_info':
             if not opt.meta:
                 raise ValueError("opt.meta must be provided when task='meta_info'")
+            # meta_info 模式更适合你后面接自己整理的数据描述文件。
             self.dir_LQ = opt.dataroot
             self.dir_GT = opt.dataroot
 
@@ -101,6 +114,7 @@ class CombinedDataset(BaseDataset):
             A_path = self.A_paths[index % self.A_size]  # make sure index is within then range
             B_path = self.B_paths[index % self.B_size]
 
+        # condition = 退化图，gt = 清晰图；这里是整个恢复任务的数据语义起点。
         condition = Image.open(A_path).convert('RGB') #condition
         gt = Image.open(B_path).convert('RGB') #gt
         
@@ -111,6 +125,7 @@ class CombinedDataset(BaseDataset):
         condition = A_transform(condition)
         gt = B_transform(gt)
         if self.opt.phase == 'train':
+            # 对过小图像做兜底 resize，避免训练阶段出现非法 crop。
             if h < 256 or w < 256:
                 osize = [256, 256]
                 resi = transforms.Resize(osize, transforms.InterpolationMode.BICUBIC)
