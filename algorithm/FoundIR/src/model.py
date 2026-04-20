@@ -1182,6 +1182,7 @@ class Trainer(object):
         convert_image_to=None,
         condition=False,
         sub_dir=False,
+        data_mode='paired',
     ):
         super().__init__()
 
@@ -1206,16 +1207,19 @@ class Trainer(object):
         self.train_num_steps = train_num_steps
         self.image_size = diffusion_model.image_size
         self.condition = condition
+        self.data_mode = data_mode
         self.ema = EMA(diffusion_model, beta=ema_decay,
               update_every=ema_update_every)
 
         if self.condition:
             if opts.phase == "train":
-                if 'combined' or 'all' in results_folder:
+                if self.data_mode in ('combined', 'all', 'paired', 'meta_info'):
                     self.dl = cycle(self.accelerator.prepare(DataLoader(dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=8)))
-                elif 'paired' in results_folder:
+                elif self.data_mode == 'paired_split':
                     self.dl_light = cycle(self.accelerator.prepare(DataLoader(dataset[0], batch_size=32, shuffle=True, pin_memory=True, num_workers=8)))
                     self.dl_night = cycle(self.accelerator.prepare(DataLoader(dataset[1], batch_size=32, shuffle=True, pin_memory=True, num_workers=8)))
+                else:
+                    raise ValueError(f"Unsupported Trainer data_mode: {self.data_mode}")
                     
             else:
                 self.sample_dataset = dataset
@@ -1283,9 +1287,9 @@ class Trainer(object):
                 
                 for _ in range(self.gradient_accumulate_every):
                     if self.condition:
-                        if 'combined' or 'all' in str(results_folder):
+                        if self.data_mode in ('combined', 'all', 'paired', 'meta_info'):
                             data = next(self.dl)                
-                        elif 'paired' in str(results_folder):
+                        elif self.data_mode == 'paired_split':
                             batch1 = next(self.dl_light)
                             batch2 = next(self.dl_night)
                             data = {}
@@ -1294,6 +1298,8 @@ class Trainer(object):
                                     data[k] = batch1[k] + batch2[k] ## data['A_paths'] = [b1_path,b2_path]
                                 else:
                                     data[k] = torch.cat([batch1[k], batch2[k]], dim=0) # data['adap'] = torch.cat([b1_adap, b2_adap], dim=0)
+                        else:
+                            raise ValueError(f"Unsupported Trainer data_mode: {self.data_mode}")
                         gt = data["gt"].to(self.device)
                         cond_input = data["adap"].to(self.device)
 

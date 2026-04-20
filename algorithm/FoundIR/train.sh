@@ -1,7 +1,16 @@
-## Two stage training script for FoundIR
+#!/usr/bin/env bash
 
-## First stage: train the model on single degradation
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 --master_port=7689 train.py --meta ./MillionIRData_single_train_meta_info.txt
+# Example FoundIR training command.
+# Replace DATA_ROOT and META_PATH with your own dataset paths.
 
-## Second stage: train the model on all degradations. Please uncomment Line49 and Line95 in train.py
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 --master_port=7689 train.py --meta ./MillionIRData_train_meta_info.txt
+python train.py \
+  --dataroot /path/to/dataset_root \
+  --meta /path/to/train_meta.txt \
+  --dataset_mode meta_info \
+  --phase train \
+  --batch_size 8 \
+  --image_size 512 \
+  --crop_size 256 \
+  --sampling_timesteps 10 \
+  --train_num_steps 500000 \
+  --results_folder ./ckpt_single_multi
