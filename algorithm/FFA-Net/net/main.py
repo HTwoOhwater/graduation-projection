@@ -21,10 +21,12 @@ models_={
 	'ffa':FFA(gps=opt.gps,blocks=opt.blocks),
 }
 loaders_={
-	'its_train':ITS_train_loader,
-	'its_test':ITS_test_loader,
-	'ots_train':OTS_train_loader,
-	'ots_test':OTS_test_loader
+	'its_train':'its_train',
+	'its_test':'its_test',
+	'ots_train':'ots_train',
+	'ots_test':'ots_test',
+	'dehaze_train':'dehaze_train',
+	'dehaze_test':'dehaze_test'
 }
 start_time=time.time()
 T=opt.steps	
@@ -136,8 +138,8 @@ def test(net,loader_test,max_psnr,max_ssim,step):
 
 
 if __name__ == "__main__":
-	loader_train=loaders_[opt.trainset]
-	loader_test=loaders_[opt.testset]
+	loader_train=build_loader(loaders_[opt.trainset])
+	loader_test=build_loader(loaders_[opt.testset])
 	net=models_[opt.net]
 	net=net.to(opt.device)
 	if opt.device=='cuda':
@@ -155,4 +157,3 @@ if __name__ == "__main__":
 	optimizer.zero_grad()
 	train(net,loader_train,loader_test,optimizer,criterion)
 	
-

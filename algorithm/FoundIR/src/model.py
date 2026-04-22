@@ -1,50 +1,160 @@
-"""FoundIR 模型主体文件。
-
-这里现在只保留两类内容：
-1. 网络结构（如 Unet / UnetRes）
-2. 扩散过程本身（ResidualDiffusion）
-
-把 Trainer 和通用工具从这里拆出去的原因是：
-模型文件应该尽量回答“模型是什么、前向和采样怎么做”，
-而不是同时承担训练调度、日志保存、patch 推理等工程职责。
-"""
-
 import math
+import os
+import random
 from collections import namedtuple
 from functools import partial
+from pathlib import Path
+import torchvision.transforms as transforms
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from accelerate import Accelerator
 from einops import rearrange, reduce
+# from einops.layers.torch import Rearrange
+from ema_pytorch import EMA
+import time
 from torch import einsum, nn
-from torch.optim import RAdam
-import importlib
+from torch.optim import Adam, RAdam
+from torch.utils.data import DataLoader
+from torchvision import transforms as T
+from torchvision import utils
 from tqdm.auto import tqdm
-
-try:
-    from thop import profile
-except ImportError:
-    profile = None
-
-from src.utils import (
-    default,
-    exists,
-    identity,
-    normalize_to_neg_one_to_one,
-    num_to_groups,
-    set_seed,
-    tensor2img,
-    unnormalize_to_zero_to_one,
-)
+from thop import profile
+from torchvision.utils import make_grid
+import importlib
+from PIL import Image
 
 ModelResPrediction = namedtuple(
     'ModelResPrediction', ['pred_res', 'pred_noise', 'pred_x_start'])
+# helpers functions
 metric_module = importlib.import_module('metrics')
+
+def set_seed(SEED):
+    # initialize random seed
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
+
+def tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
+    """Convert torch Tensors into image numpy arrays.
+
+    After clamping to [min, max], values will be normalized to [0, 1].
+
+    Args:
+        tensor (Tensor or list[Tensor]): Accept shapes:
+            1) 4D mini-batch Tensor of shape (B x 3/1 x H x W);
+            2) 3D Tensor of shape (3/1 x H x W);
+            3) 2D Tensor of shape (H x W).
+            Tensor channel should be in RGB order.
+        rgb2bgr (bool): Whether to change rgb to bgr.
+        out_type (numpy type): output types. If ``np.uint8``, transform outputs
+            to uint8 type with range [0, 255]; otherwise, float type with
+            range [0, 1]. Default: ``np.uint8``.
+        min_max (tuple[int]): min and max values for clamp.
+
+    Returns:
+        (Tensor or list): 3D ndarray of shape (H x W x C) OR 2D ndarray of
+        shape (H x W). The channel order is BGR.
+    """
+    if not (torch.is_tensor(tensor) or
+            (isinstance(tensor, list)
+             and all(torch.is_tensor(t) for t in tensor))):
+        raise TypeError(
+            f'tensor or list of tensors expected, got {type(tensor)}')
+
+    if torch.is_tensor(tensor):
+        tensor = [tensor]
+    result = []
+    for _tensor in tensor:
+        _tensor = _tensor.squeeze(0).float().detach().cpu().clamp_(*min_max)
+        _tensor = (_tensor - min_max[0]) / (min_max[1] - min_max[0])
+
+        n_dim = _tensor.dim()
+        if n_dim == 4:
+            img_np = make_grid(
+                _tensor, nrow=int(math.sqrt(_tensor.size(0))),
+                normalize=False).numpy()
+            img_np = img_np.transpose(1, 2, 0)
+            if rgb2bgr:
+                img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        elif n_dim == 3:
+            img_np = _tensor.numpy()
+            img_np = img_np.transpose(1, 2, 0)
+            if img_np.shape[2] == 1:  # gray image
+                img_np = np.squeeze(img_np, axis=2)
+            else:
+                if rgb2bgr:
+                    img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        elif n_dim == 2:
+            img_np = _tensor.numpy()
+        else:
+            raise TypeError('Only support 4D, 3D or 2D tensor. '
+                            f'But received with dimension: {n_dim}')
+        if out_type == np.uint8:
+            # Unlike MATLAB, numpy.unit8() WILL NOT round by default.
+            img_np = (img_np * 255.0).round()
+        img_np = img_np.astype(out_type)
+        result.append(img_np)
+    if len(result) == 1:
+        result = result[0]
+    return result
+
+def exists(x):
+    return x is not None
+
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if callable(d) else d
+
+
+def identity(t, *args, **kwargs):
+    return t
+
+
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
+
+
+def has_int_squareroot(num):
+    return (math.sqrt(num) ** 2) == num
+
+
+def num_to_groups(num, divisor):
+    groups = num // divisor
+    remainder = num % divisor
+    arr = [divisor] * groups
+    if remainder > 0:
+        arr.append(remainder)
+    return arr
+
+
+# normalization functions
+
+
+def normalize_to_neg_one_to_one(img):
+    if isinstance(img, list):
+        return [img[k] * 2 - 1 for k in range(len(img))]
+    else:
+        return img * 2 - 1
+
+
+def unnormalize_to_zero_to_one(img):
+    if isinstance(img, list):
+        return [(img[k] + 1) * 0.5 for k in range(len(img))]
+    else:
+        return (img + 1) * 0.5
 
 # small helper modules
 
 
 class Residual(nn.Module):
-    # 最基础的残差包装模块，后面多个 block 都复用这类思想。
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
@@ -250,7 +360,6 @@ class Attention(nn.Module):
 
 
 class Unet(nn.Module):
-    # 原项目中的基础 U-Net 主干。
     def __init__(
         self,
         dim,
@@ -391,7 +500,6 @@ class Unet(nn.Module):
 
 
 class UnetRes(nn.Module):
-    # 面向恢复任务的主干封装。当前训练主线就是围绕它构建。
     def __init__(
         self,
         dim,
@@ -512,13 +620,6 @@ def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999) -> torch.Tensor
 
 
 class ResidualDiffusion(nn.Module):
-    """条件扩散恢复的核心实现。
-
-    如果你以后要继续改 FoundIR，优先在这里理解三件事：
-    1. 训练时如何构造 q_sample
-    2. 网络到底在预测什么（如 pred_res）
-    3. 采样阶段如何从 condition 邻域逐步恢复
-    """
     def __init__(
         self,
         model,
@@ -1055,3 +1156,431 @@ class ResidualDiffusion(nn.Module):
     # def forward(self, x_input_sample, batches, last, file_):
     #     # profile
     #     return self.sample(x_input_sample, batch_size=batches, last=last, task=file_)
+
+class Trainer(object):
+    def __init__(
+        self,
+        diffusion_model,
+        dataset,
+        opts,
+        *,
+        train_batch_size=16,
+        gradient_accumulate_every=1,
+        augment_flip=True,
+        train_lr=1e-4,
+        train_num_steps=100000,
+        ema_update_every=10,
+        ema_decay=0.995,
+        adam_betas=(0.9, 0.99),
+        save_and_sample_every=1000,
+        num_unet=1,
+        num_samples=25,
+        results_folder='./results/sample',
+        amp=False,
+        fp16=False,
+        split_batches=True,
+        convert_image_to=None,
+        condition=False,
+        sub_dir=False,
+    ):
+        super().__init__()
+
+        self.accelerator = Accelerator(
+            split_batches=split_batches,
+            mixed_precision='fp16' if fp16 else 'no'
+        )
+        self.sub_dir = sub_dir
+        self.accelerator.native_amp = amp
+        self.num_unet = num_unet
+        self.model = diffusion_model
+        self.results_folder = results_folder
+
+        assert has_int_squareroot(
+            num_samples), 'number of samples must have an integer square root'
+        self.num_samples = num_samples
+        self.save_and_sample_every = save_and_sample_every
+
+        self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+
+        self.train_num_steps = train_num_steps
+        self.image_size = diffusion_model.image_size
+        self.condition = condition
+        self.ema = EMA(diffusion_model, beta=ema_decay,
+              update_every=ema_update_every)
+
+        if self.condition:
+            if opts.phase == "train":
+                if 'combined' or 'all' in results_folder:
+                    self.dl = cycle(self.accelerator.prepare(DataLoader(dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=8)))
+                elif 'paired' in results_folder:
+                    self.dl_light = cycle(self.accelerator.prepare(DataLoader(dataset[0], batch_size=32, shuffle=True, pin_memory=True, num_workers=8)))
+                    self.dl_night = cycle(self.accelerator.prepare(DataLoader(dataset[1], batch_size=32, shuffle=True, pin_memory=True, num_workers=8)))
+                    
+            else:
+                self.sample_dataset = dataset
+                
+
+        # optimizer
+        self.opt0 = Adam(diffusion_model.parameters(), lr=train_lr, betas=adam_betas)
+
+        if self.accelerator.is_main_process:
+            # self.ema = EMA(diffusion_model, beta=ema_decay,
+            #                update_every=ema_update_every)
+            self.set_results_folder(results_folder)
+
+        # step counter state
+        self.step = 0
+
+        # prepare model, dataloader, optimizer with accelerator
+        self.model, self.opt0 = self.accelerator.prepare(self.model, self.opt0)
+        
+        device = self.accelerator.device
+        self.device = device
+
+    def save(self, milestone):
+        if not self.accelerator.is_local_main_process:
+            return
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt0': self.opt0.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
+        }
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
+    def load(self, milestone):
+        path = Path(self.results_folder) / f'model-{milestone}.pt'
+        if path.exists():
+            data = torch.load(str(path), map_location=self.device)
+            self.model = self.accelerator.unwrap_model(self.model)
+  
+            self.model.load_state_dict(data['model'])
+            self.step = data['step']
+            
+            self.opt0.load_state_dict(data['opt0'])
+            self.opt0.param_groups[0]['capturable'] = True
+
+            self.ema.load_state_dict(data['ema'])
+
+            if exists(self.accelerator.scaler) and exists(data['scaler']):
+                self.accelerator.scaler.load_state_dict(data['scaler'])
+
+            print("load model - "+str(path))
+
+        # self.ema.to(self.device)
+
+    def train(self):
+        accelerator = self.accelerator
+        results_folder = self.results_folder
+
+        with tqdm(initial=self.step, total=self.train_num_steps, disable=not accelerator.is_main_process) as pbar:
+
+            while self.step < self.train_num_steps:
+
+                total_loss = [0]
+                
+                for _ in range(self.gradient_accumulate_every):
+                    if self.condition:
+                        if 'combined' or 'all' in str(results_folder):
+                            data = next(self.dl)                
+                        elif 'paired' in str(results_folder):
+                            batch1 = next(self.dl_light)
+                            batch2 = next(self.dl_night)
+                            data = {}
+                            for k, v in batch1.items():
+                                if 'path' in k:
+                                    data[k] = batch1[k] + batch2[k] ## data['A_paths'] = [b1_path,b2_path]
+                                else:
+                                    data[k] = torch.cat([batch1[k], batch2[k]], dim=0) # data['adap'] = torch.cat([b1_adap, b2_adap], dim=0)
+                        gt = data["gt"].to(self.device)
+                        cond_input = data["adap"].to(self.device)
+
+                        task = data["A_paths"]
+                        data = [gt, cond_input, task]
+                    else:
+                        data = next(self.dl)
+                        data = data[0] if isinstance(data, list) else data
+                        data = data.to(self.device)
+
+                    with self.accelerator.autocast():
+                        loss = self.model(data)
+                        for i in range(self.num_unet):
+                            loss[i] = loss[i] / self.gradient_accumulate_every
+                            total_loss[i] = total_loss[i] + loss[i].item()
+
+                    for i in range(self.num_unet):
+                        self.accelerator.backward(loss[i])
+
+                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+
+                accelerator.wait_for_everyone()
+
+                self.opt0.step()
+                self.opt0.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    self.ema.to(self.device)
+                    self.ema.update()
+
+                    if self.step != 0 and self.step % (self.save_and_sample_every*10) == 0:
+                        milestone = self.step // self.save_and_sample_every
+                        self.save(milestone)
+                        
+                pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
+                pbar.update(1)
+
+        accelerator.print('training complete')
+    
+    def test(self, sample=False, last=True, FID=False, crop_phase=None, crop_size=None, crop_stride=None):
+        self.ema.ema_model.init()
+        self.ema.to(self.device)
+        print("test start")
+        if self.condition:
+            self.ema.ema_model.eval()
+            loader = DataLoader(
+                dataset=self.sample_dataset,
+                batch_size=1)
+            i = 0
+            cnt = 0
+            # opt_metric = {
+            #     'psnr': {
+            #         'type': 'calculate_psnr',
+            #         'crop_border': 0,
+            #         'test_y_channel': True
+            #         },
+            #     'ssim': {
+            #         'type': 'calculate_ssim',
+            #         'crop_border': 0,
+            #         'test_y_channel': True
+            #         }
+            #     }
+            # self.metric_results = {
+            #     metric: 0
+            #     for metric in opt_metric.keys()
+            # }
+            tran = transforms.ToTensor()
+            for items in loader:
+                if self.condition:
+                    file_ = items["B_paths"][0] 
+                    file_name = file_.split('/')[-3]
+                else:
+                    file_name = f'{i}.png'
+
+                i += 1
+                
+                start_time = time.time()
+                
+                # if crop_size is not None:
+                #     patches, positions = self.split_image(data["adap"], crop_size, crop_stride)
+                with torch.no_grad():
+                    batches = self.num_samples
+                    
+                    data = items
+                    x_input_sample = data["adap"].to(self.device)
+                    _, _, h, w = x_input_sample.shape 
+                    # gt = data["gt"].to(self.device)
+                    # import pdb; pdb.set_trace()
+                    if crop_phase == 'weight' and crop_size is not None:
+                        if (h * w) > crop_size**2:
+                            patches, positions = self.split_image(x_input_sample, crop_size, crop_stride)
+                            processed_patches = []
+                            for p in patches:
+                                p_images_list = list(self.ema.ema_model.sample(
+                                p, batch_size=batches, last=last, task=file_))
+                                p_images_list = [p_images_list[-1]]
+                                p_images = torch.cat(p_images_list, dim=0)
+                                processed_patches.append(p_images)
+                            
+                            all_images = self.merge_patches_with_weights(processed_patches, positions, x_input_sample.shape, crop_size, crop_stride)
+                        else:
+                            all_images_list = list(self.ema.ema_model.sample(
+                            x_input_sample, batch_size=batches, last=last, task=file_))
+                            all_images_list = [all_images_list[-1]]
+                            all_images = torch.cat(all_images_list, dim=0)
+
+                    elif crop_phase == 'im2overlap' and crop_size is not None:
+                        if (h * w) > crop_size**2:
+                            patches, idx, size = self.img2patch(x_input_sample, scale=1, crop_size=crop_size)
+                
+                            with torch.no_grad():
+                                n = len(patches)
+                                outs = []
+                                m = 1
+                                i = 0
+                                while i < n:
+                                    j = i + m
+                                    if j >= n:
+                                        j = n
+                                    pred = output = self.ema.ema_model.sample(patches[i:j], batch_size=batches, last=last, task=file_)
+                                    if isinstance(pred, list):
+                                        pred = pred[-1]
+                                    outs.append(pred.detach())
+                                    i = j
+                                output = torch.cat(outs, dim=0)
+
+                            all_images = self.patch2img(output, idx, size, scale=1, crop_size=crop_size)
+                        else:
+                            all_images_list = list(self.ema.ema_model.sample(
+                            x_input_sample, batch_size=batches, last=last, task=file_))
+                            all_images_list = [all_images_list[-1]]
+                            all_images = torch.cat(all_images_list, dim=0)
+                            
+                    else:
+                        all_images_list = list(self.ema.ema_model.sample(
+                            x_input_sample, batch_size=batches, last=last, task=file_))
+                        all_images_list = [all_images_list[-1]]
+                        all_images = torch.cat(all_images_list, dim=0)
+                        
+                print(time.time()-start_time)         
+ 
+                if last:
+                    nrow = int(math.sqrt(self.num_samples))
+                else:
+                    nrow = all_images.shape[0]
+                save_path = str(self.results_folder / file_name)
+                os.makedirs(save_path, exist_ok=True)
+                full_path = os.path.join(save_path, file_.split('/')[-1]).replace('_fake_B','')
+                utils.save_image(all_images, full_path, nrow=nrow)
+                print("test-save "+full_path)
+                
+            #calculate the metric
+            
+            #     sr_img = tensor2img(all_images, rgb2bgr=True)
+            #     gt_img = tensor2img(gt, rgb2bgr=True)
+            #     opt_metric_ = {
+            #         'psnr': {
+            #             'type': 'calculate_psnr',
+            #             'crop_border': 0,
+            #             'test_y_channel': True
+            #             },
+            #         'ssim': {
+            #             'type': 'calculate_ssim',
+            #             'crop_border': 0,
+            #             'test_y_channel': True
+            #             }
+            #         }
+            #     for name, opt_ in opt_metric_.items():
+            #         metric_type = opt_.pop('type')
+            #         self.metric_results[name] += getattr(metric_module, metric_type)(sr_img, gt_img, **opt_)
+               
+            #     cnt += 1
+
+            # current_metric = {}
+            # for metric in self.metric_results.keys():
+            #     self.metric_results[metric] /= cnt
+            #     current_metric[metric] = self.metric_results[metric]
+            # print(current_metric['psnr'])
+            # print(current_metric['ssim'])
+        
+        print("test end")
+
+    def set_results_folder(self, path):
+        self.results_folder = Path(path)
+        if not self.results_folder.exists():
+            os.makedirs(self.results_folder)
+
+    def split_image(self, image, patch_size, overlap):
+        b, c, h, w = image.shape
+        patches = []
+        positions = []
+
+        for i in range(0, w, patch_size - overlap):
+            for j in range(0, h, patch_size - overlap):
+                right = min(i + patch_size, w)
+                bottom = min(j + patch_size, h)
+                patch = image[:, :, j:bottom, i:right]
+                patches.append(patch)
+                positions.append((i, j))
+        return patches, positions
+    
+    def create_weight_map(self, patch_size, overlap):
+        weight_map = torch.ones((patch_size, patch_size), dtype=torch.float32).to(self.device)
+        ramp = torch.linspace(0, 1, overlap).to(self.device)
+        weight_map[:overlap, :] *= ramp[:, None]
+        weight_map[-overlap:, :] *= ramp.flip(0)[:, None]
+        weight_map[:, :overlap] *= ramp[None, :]
+        weight_map[:, -overlap:] *= ramp.flip(0)[None, :]
+        return weight_map
+
+    def merge_patches_with_weights(self, patches, positions, image_size, patch_size, overlap):
+        b, c, h, w = image_size
+        result = torch.zeros((b, c, h, w), dtype=torch.float32).to(self.device)
+        weight = torch.zeros((b, c, h, w), dtype=torch.float32).to(self.device)
+        weight_map = self.create_weight_map(patch_size, overlap).unsqueeze(0).unsqueeze(0)
+
+        for patch, (i, j) in zip(patches, positions):
+            patch_h, patch_w = patch.shape[2:]
+            weighted_patch = patch * weight_map[:, :, :patch_h, :patch_w]
+            result[:, :, j:j+patch_h, i:i+patch_w] += weighted_patch
+            weight[:, :, j:j+patch_h, i:i+patch_w] += weight_map[:, :, :patch_h, :patch_w]
+    
+        result /= weight
+        return result
+
+    def img2patch(self, lq, scale=1, crop_size=1024, overlap=512): ## 128-200
+        b, c, hl, wl = lq.size()    
+        h, w = hl * scale, wl * scale
+        sr_size = (b, c, h, w)
+        assert b == 1
+
+        crop_size_h, crop_size_w = crop_size // scale * scale, crop_size // scale * scale
+
+        # adaptive step_i, step_j with overlap consideration
+        num_row = (h - 1) // (crop_size_h - overlap) + 1
+        num_col = (w - 1) // (crop_size_w - overlap) + 1
+
+        step_j = crop_size_w - overlap
+        step_i = crop_size_h - overlap
+
+        # ensure steps are aligned with scale
+        step_i = step_i // scale * scale
+        step_j = step_j // scale * scale
+
+        parts = []
+        idxes = []
+
+        i = 0  # 0~h-1
+        last_i = False
+        while i < h and not last_i:
+            j = 0
+            if i + crop_size_h >= h:
+                i = h - crop_size_h
+                last_i = True
+
+            last_j = False
+            while j < w and not last_j:
+                if j + crop_size_w >= w:
+                    j = w - crop_size_w
+                    last_j = True
+                parts.append(lq[:, :, i // scale : (i + crop_size_h) // scale, j // scale : (j + crop_size_w) // scale])
+                idxes.append({'i': i, 'j': j})
+                j = j + step_j
+            i = i + step_i
+
+        return torch.cat(parts, dim=0), idxes, sr_size
+
+    def patch2img(self, outs, idxes, sr_size, scale=1, crop_size=1024):
+        preds = torch.zeros(sr_size).to(outs.device)
+        b, c, h, w = sr_size
+
+        count_mt = torch.zeros((b, 1, h, w)).to(outs.device)
+        crop_size_h, crop_size_w = crop_size // scale * scale, crop_size // scale * scale
+
+        for cnt, each_idx in enumerate(idxes):
+            i = each_idx['i']
+            j = each_idx['j']
+
+            # Using slice to add weighted values in the overlapping regions
+            preds[0, :, i : i + crop_size_h, j : j + crop_size_w] += outs[cnt]
+            count_mt[0, 0, i : i + crop_size_h, j : j + crop_size_w] += 1.
+
+        # Avoid division by zero
+        count_mt = torch.clamp(count_mt, min=1.0)
+        
+        # Normalize to average the overlapping areas
+        return (preds / count_mt).to(outs.device)

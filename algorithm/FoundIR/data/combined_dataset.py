@@ -1,26 +1,20 @@
-"""FoundIR 的配对数据集实现。
-
-这里保留两种最常用的数据组织方式：
-1. `paired`：目录下直接有 `LQ/` 和 `GT/`
-2. `meta_info`：由 meta 文件显式指定配对关系
-
-把数据逻辑集中在这里的意义是：后续你换数据、换配对方式时，
-只需要在 dataset 层改，不需要碰训练器和模型主体。
-"""
-
 import os
 from os import path as osp
-from pathlib import Path
-import random
-
-import cv2
-import numpy as np
-from PIL import Image
-import torchvision.transforms as transforms
-import torchvision.transforms.functional as TF
-
 from data.base_dataset import BaseDataset, get_params, get_transform
-from data.image_folder import make_dataset
+from data.image_folder import make_dataset 
+from PIL import Image
+from pathlib import Path
+import numpy as np
+import random
+import torchvision.transforms.functional as TF
+import torchvision.transforms as transforms
+try:
+    import Augmentor
+except ImportError:
+    Augmentor = None
+import math
+import torch
+import cv2
 
 def paired_paths_from_meta_info_file(folders, keys, meta_info_file):
 
@@ -63,34 +57,34 @@ class CombinedDataset(BaseDataset):
         self.generation = generation
         self.image_size = image_size
         self.opt = opt
-        # task 显式表示“这份数据是怎么组织的”，避免行为依赖文件夹命名或脚本注释。
-        self.task = task or 'paired'
-
-        if self.task == 'paired':
-            # 最朴素的配对模式：直接从 LQ/GT 两个目录读取。
+        self.task = task
+        #origin----------------------------------------------------------------------------------------------------------
+        if task == None:
             self.dir_LQ = os.path.join(opt.dataroot, 'LQ')
             self.dir_GT = os.path.join(opt.dataroot, 'GT')
 
             self.A_paths = sorted(make_dataset(self.dir_LQ, opt.max_dataset_size))
             self.B_paths = sorted(make_dataset(self.dir_GT, opt.max_dataset_size))
-        elif self.task == 'meta_info':
-            if not opt.meta:
-                raise ValueError("opt.meta must be provided when task='meta_info'")
-            # meta_info 模式更适合你后面接自己整理的数据描述文件。
+
+        if task == 'meta_info' and opt.meta is not None:
             self.dir_LQ = opt.dataroot
             self.dir_GT = opt.dataroot
 
             self.paths = paired_paths_from_meta_info_file(
                 [self.dir_LQ, self.dir_GT], ['adap', 'gt'], opt.meta)
+            
             self.A_paths = [path['adap_path'] for path in self.paths]
             self.B_paths = [path['gt_path'] for path in self.paths]
-        else:
-            raise ValueError(f"Unsupported dataset task: {self.task}")
+            self.A_size = len(self.A_paths)
+            print(len(self.A_paths))
+            self.B_size = len(self.B_paths)
+            print(len(self.B_paths))
 
-        self.A_size = len(self.A_paths)
-        self.B_size = len(self.B_paths)
-        print(self.A_size)
-        print(self.B_size)
+        else:
+            self.A_size = len(self.A_paths)  # get the size of dataset A
+            print(self.A_size)
+            self.B_size = len(self.B_paths)  # get the size of dataset B
+            print(self.B_size)
         assert(self.opt.load_size >= self.opt.crop_size)   # crop_size should be smaller than the size of loaded image
 
     def __getitem__(self, index):
@@ -106,7 +100,7 @@ class CombinedDataset(BaseDataset):
             B_paths (str) - - image paths (same as A_paths)
         """
         # read a image given a random integer index
-        if self.task == 'meta_info':
+        if self.task == 'meta_info' and self.opt.meta is not None:
             paths = self.paths[index]
             A_path = paths['adap_path']
             B_path = paths['gt_path']
@@ -114,7 +108,6 @@ class CombinedDataset(BaseDataset):
             A_path = self.A_paths[index % self.A_size]  # make sure index is within then range
             B_path = self.B_paths[index % self.B_size]
 
-        # condition = 退化图，gt = 清晰图；这里是整个恢复任务的数据语义起点。
         condition = Image.open(A_path).convert('RGB') #condition
         gt = Image.open(B_path).convert('RGB') #gt
         
@@ -125,7 +118,6 @@ class CombinedDataset(BaseDataset):
         condition = A_transform(condition)
         gt = B_transform(gt)
         if self.opt.phase == 'train':
-            # 对过小图像做兜底 resize，避免训练阶段出现非法 crop。
             if h < 256 or w < 256:
                 osize = [256, 256]
                 resi = transforms.Resize(osize, transforms.InterpolationMode.BICUBIC)

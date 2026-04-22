@@ -48,7 +48,10 @@ class Trainer(object):
         results_folder='./results/sample',
         amp=False,
         fp16=False,
+        mixed_precision='no',
         split_batches=True,
+        num_workers=4,
+        pin_memory=True,
         convert_image_to=None,
         condition=False,
         sub_dir=False,
@@ -58,7 +61,8 @@ class Trainer(object):
 
         self.accelerator = Accelerator(
             split_batches=split_batches,
-            mixed_precision='fp16' if fp16 else 'no'
+            mixed_precision=mixed_precision,
+            gradient_accumulation_steps=gradient_accumulate_every
         )
         self.sub_dir = sub_dir
         self.accelerator.native_amp = amp
@@ -73,6 +77,8 @@ class Trainer(object):
 
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
 
         self.train_num_steps = train_num_steps
         self.image_size = diffusion_model.image_size
@@ -84,11 +90,29 @@ class Trainer(object):
         if self.condition:
             if opts.phase == "train":
                 # data_mode 现在是显式配置，不再靠 results_folder 名称隐式决定行为。
-                if self.data_mode in ('combined', 'all', 'paired', 'meta_info'):
-                    self.dl = cycle(self.accelerator.prepare(DataLoader(dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True, num_workers=8)))
+                if self.data_mode in ('combined', 'all', 'paired', 'meta_info', 'split_stem'):
+                    self.dl = cycle(self.accelerator.prepare(DataLoader(
+                        dataset,
+                        batch_size=self.batch_size,
+                        shuffle=True,
+                        pin_memory=self.pin_memory,
+                        num_workers=self.num_workers
+                    )))
                 elif self.data_mode == 'paired_split':
-                    self.dl_light = cycle(self.accelerator.prepare(DataLoader(dataset[0], batch_size=32, shuffle=True, pin_memory=True, num_workers=8)))
-                    self.dl_night = cycle(self.accelerator.prepare(DataLoader(dataset[1], batch_size=32, shuffle=True, pin_memory=True, num_workers=8)))
+                    self.dl_light = cycle(self.accelerator.prepare(DataLoader(
+                        dataset[0],
+                        batch_size=32,
+                        shuffle=True,
+                        pin_memory=self.pin_memory,
+                        num_workers=self.num_workers
+                    )))
+                    self.dl_night = cycle(self.accelerator.prepare(DataLoader(
+                        dataset[1],
+                        batch_size=32,
+                        shuffle=True,
+                        pin_memory=self.pin_memory,
+                        num_workers=self.num_workers
+                    )))
                 else:
                     raise ValueError(f"Unsupported Trainer data_mode: {self.data_mode}")
 
@@ -147,11 +171,10 @@ class Trainer(object):
             while self.step < self.train_num_steps:
 
                 total_loss = [0]
-
-                for _ in range(self.gradient_accumulate_every):
+                with accelerator.accumulate(self.model):
                     if self.condition:
                         # 这里把 dataloader 输出整理成模型真正需要的 [gt, cond_input, task] 结构。
-                        if self.data_mode in ('combined', 'all', 'paired', 'meta_info'):
+                        if self.data_mode in ('combined', 'all', 'paired', 'meta_info', 'split_stem'):
                             data = next(self.dl)
                         elif self.data_mode == 'paired_split':
                             batch1 = next(self.dl_light)
@@ -177,18 +200,19 @@ class Trainer(object):
                     with self.accelerator.autocast():
                         loss = self.model(data)
                         for i in range(self.num_unet):
-                            loss[i] = loss[i] / self.gradient_accumulate_every
                             total_loss[i] = total_loss[i] + loss[i].item()
 
                     for i in range(self.num_unet):
                         self.accelerator.backward(loss[i])
 
-                accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
 
-                accelerator.wait_for_everyone()
+                    self.opt0.step()
+                    self.opt0.zero_grad()
 
-                self.opt0.step()
-                self.opt0.zero_grad()
+                if not accelerator.sync_gradients:
+                    continue
 
                 accelerator.wait_for_everyone()
 
@@ -197,12 +221,15 @@ class Trainer(object):
                     self.ema.to(self.device)
                     self.ema.update()
 
-                    if self.step != 0 and self.step % (self.save_and_sample_every * 10) == 0:
+                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         milestone = self.step // self.save_and_sample_every
                         self.save(milestone)
 
                 pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
                 pbar.update(1)
+
+        if accelerator.is_main_process and self.step > 0:
+            self.save('last')
 
         accelerator.print('training complete')
 

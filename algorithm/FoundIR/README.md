@@ -105,7 +105,7 @@ conda env create -f environment.yml
 ```
 - Run the following command to test the generalist model.
 ```
-python test.py --dataroot ./dataset --meta /path/to/test_meta.txt --checkpoint_dir ./ckpt_single_multi --checkpoint_milestone 2000
+python test.py --dataroot ./dataset --meta ./Testset_meta_info.txt
 ```
 </details>
 
@@ -170,8 +170,7 @@ python cal_metrics.py --inp_imgs ./dataset/restored --gt_imgs ./dataset/GT --log
 ---
 ### :computer: Training
 
-The local copy in this repository has been simplified for paired restoration experiments.
-Use `train.py` directly or treat `train.sh` as an example command template.
+Our FoundIR is trained in two stages, please follow the steps in `train.sh` to train the model.
 ```
 sh train.sh
 ```
