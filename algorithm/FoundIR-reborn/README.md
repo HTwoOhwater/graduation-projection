@@ -170,8 +170,92 @@ python cal_metrics.py --inp_imgs ./dataset/restored --gt_imgs ./dataset/GT --log
 ---
 ### :computer: Training
 
-The local copy in this repository has been simplified for paired restoration experiments.
-Use `train.py` directly or treat `train.sh` as an example command template.
+The local copy in this repository has been simplified for paired restoration experiments on a split dataset such as:
+
+```
+datasets/
+  train/
+    haze_images/
+    original_images/
+  valid/
+    haze_images/
+    original_images/
+  test/
+    haze_images/
+    original_images/
+```
+
+The current local version also supports filename pairing like:
+
+```
+cloudy_0007_1_2.jpg -> cloudy_0007.jpg
+```
+
+where the last two suffixes can be preserved as future labels while the stem is used for GT matching.
+
+#### :arrow_right: Single-GPU Training
+
+Use `train.py` directly:
+
+```bash
+python train.py \
+  --dataroot /mnt/workspace/Dehaze/datasets \
+  --dataset_mode split_stem \
+  --split train \
+  --lq_dirname haze_images \
+  --gt_dirname original_images \
+  --batch_size 4 \
+  --image_size 512 \
+  --crop_size 256 \
+  --sampling_timesteps 10 \
+  --train_num_steps 500000 \
+  --gradient_accumulate_every 2 \
+  --mixed_precision fp16 \
+  --num_workers 4 \
+  --results_folder /mnt/workspace/Dehaze/result/foundir_reborn_train
+```
+
+#### :arrow_right: Multi-GPU Training with `accelerate`
+
+This local version is now adapted for `accelerate launch` and is compatible with normal single-GPU execution.
+For multi-GPU training, prefer per-process batch semantics and do not enable `--split_batches` unless you intentionally want a fixed global batch to be split across devices.
+
+```bash
+accelerate launch --num_processes 2 train.py \
+  --dataroot /mnt/workspace/Dehaze/datasets \
+  --dataset_mode split_stem \
+  --split train \
+  --lq_dirname haze_images \
+  --gt_dirname original_images \
+  --batch_size 4 \
+  --image_size 512 \
+  --crop_size 256 \
+  --sampling_timesteps 10 \
+  --train_num_steps 500000 \
+  --gradient_accumulate_every 2 \
+  --mixed_precision fp16 \
+  --num_workers 2 \
+  --results_folder /mnt/workspace/Dehaze/result/foundir_reborn_train
+```
+
+#### :arrow_right: Checkpoint Saving
+
+The local training logic has been adjusted so that:
+
+- checkpoints are saved exactly every `save_and_sample_every` steps
+- a final `model-last.pt` is always saved when training ends
+
+This avoids the earlier situation where short finetune runs updated the model in memory but did not write a new checkpoint to disk.
+
+#### :arrow_right: Notes
+
+- `train.sh` is now only a local example template.
+- `batch_size` should be understood as per-process batch size when using `accelerate launch`.
+- `num_workers` is now configurable from the CLI instead of being hardcoded in the trainer.
+- `mixed_precision` is exposed through the CLI and can be set to `no`, `fp16`, or `bf16`.
+
+#### :arrow_right: Example Script
+
 ```
 sh train.sh
 ```
