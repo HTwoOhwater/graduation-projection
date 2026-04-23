@@ -12,10 +12,14 @@ warnings.filterwarnings('ignore')
 parser=argparse.ArgumentParser()
 parser.add_argument('--steps',type=int,default=100000)
 parser.add_argument('--device',type=str,default='Automatic detection')
-parser.add_argument('--resume',type=bool,default=True)
+parser.add_argument('--resume',action='store_true',help='resume from output_dir/model-last.pt if it exists')
 parser.add_argument('--eval_step',type=int,default=5000)
+parser.add_argument('--eval_print_freq',type=int,default=100,help='print validation progress every N images')
 parser.add_argument('--lr', default=0.0001, type=float, help='learning rate')
-parser.add_argument('--model_dir',type=str,default='./trained_models/')
+parser.add_argument('--model_dir',type=str,default='',help='deprecated prefix-style checkpoint path')
+parser.add_argument('--output_dir',type=str,default='./trained_models',help='directory to save checkpoints')
+parser.add_argument('--pretrained_checkpoint',type=str,default='',help='load model weights only')
+parser.add_argument('--resume_checkpoint',type=str,default='',help='resume full training state from checkpoint path')
 parser.add_argument('--trainset',type=str,default='its_train')
 parser.add_argument('--testset',type=str,default='its_test')
 parser.add_argument('--net',type=str,default='ffa')
@@ -38,15 +42,18 @@ parser.add_argument('--eval_limit',type=int,default=0,help='optional cap on eval
 opt=parser.parse_args()
 opt.device='cuda' if torch.cuda.is_available() else 'cpu'
 model_name=opt.trainset+'_'+opt.net.split('.')[0]+'_'+str(opt.gps)+'_'+str(opt.blocks)
-opt.model_dir=opt.model_dir+model_name+'.pk'
+if opt.model_dir:
+	opt.output_dir = opt.model_dir
+opt.output_dir = os.path.abspath(opt.output_dir)
+opt.last_checkpoint = os.path.join(opt.output_dir, 'model-last.pt')
 log_dir='logs/'+model_name
 
 print(opt)
-print('model_dir:',opt.model_dir)
+print('output_dir:',opt.output_dir)
 
 
-if not os.path.exists('trained_models'):
-	os.mkdir('trained_models')
+if not os.path.exists(opt.output_dir):
+	os.makedirs(opt.output_dir, exist_ok=True)
 if not os.path.exists('numpy_files'):
 	os.mkdir('numpy_files')
 if not os.path.exists('logs'):

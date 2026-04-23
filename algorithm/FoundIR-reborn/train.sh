@@ -19,7 +19,7 @@ python train.py \
   --gradient_accumulate_every 2 \
   --mixed_precision fp16 \
   --num_workers 4 \
-  --results_folder /mnt/workspace/Dehaze/result/foundir_reborn_train
+  --output_dir /mnt/workspace/Dehaze/result/foundir_reborn_train
 
 # Multi GPU with accelerate
 # accelerate launch --num_processes 2 train.py \
@@ -36,4 +36,4 @@ python train.py \
 #   --gradient_accumulate_every 2 \
 #   --mixed_precision fp16 \
 #   --num_workers 2 \
-#   --results_folder /mnt/workspace/Dehaze/result/foundir_reborn_train
+#   --output_dir /mnt/workspace/Dehaze/result/foundir_reborn_train

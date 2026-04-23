@@ -19,7 +19,7 @@ import torch
 import torchvision.transforms as transforms
 from accelerate import Accelerator
 from ema_pytorch import EMA
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from torch.utils.data import DataLoader
 from torchvision import utils
 from tqdm.auto import tqdm
@@ -41,7 +41,9 @@ class Trainer(object):
         train_num_steps=100000,
         ema_update_every=10,
         ema_decay=0.995,
+        optimizer_name='adam',
         adam_betas=(0.9, 0.99),
+        weight_decay=0.0,
         save_and_sample_every=1000,
         num_unet=1,
         num_samples=25,
@@ -119,7 +121,13 @@ class Trainer(object):
             else:
                 self.sample_dataset = dataset
 
-        self.opt0 = Adam(diffusion_model.parameters(), lr=train_lr, betas=adam_betas)
+        optimizer_name = optimizer_name.lower()
+        if optimizer_name == 'adam':
+            self.opt0 = Adam(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=weight_decay)
+        elif optimizer_name == 'adamw':
+            self.opt0 = AdamW(diffusion_model.parameters(), lr=train_lr, betas=adam_betas, weight_decay=weight_decay)
+        else:
+            raise ValueError(f"Unsupported optimizer_name: {optimizer_name}")
 
         if self.accelerator.is_main_process:
             self.set_results_folder(results_folder)
@@ -143,24 +151,36 @@ class Trainer(object):
         }
         torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
 
-    def load(self, milestone):
-        path = Path(self.results_folder) / f'model-{milestone}.pt'
+    def load(self, checkpoint, *, load_step=True, load_optimizer=True, load_ema=True):
+        if isinstance(checkpoint, (str, Path)):
+            path = Path(checkpoint)
+        else:
+            path = Path(self.results_folder) / f'model-{checkpoint}.pt'
         if path.exists():
             data = torch.load(str(path), map_location=self.device)
             self.model = self.accelerator.unwrap_model(self.model)
 
-            self.model.load_state_dict(data['model'])
-            self.step = data['step']
+            missing_keys, unexpected_keys = self.model.load_state_dict(data['model'], strict=False)
+            if load_step and 'step' in data:
+                self.step = data['step']
 
-            self.opt0.load_state_dict(data['opt0'])
-            self.opt0.param_groups[0]['capturable'] = True
+            if load_optimizer and 'opt0' in data:
+                self.opt0.load_state_dict(data['opt0'])
+                self.opt0.param_groups[0]['capturable'] = True
 
-            self.ema.load_state_dict(data['ema'])
+            if load_ema and 'ema' in data:
+                self.ema.load_state_dict(data['ema'])
 
-            if exists(self.accelerator.scaler) and exists(data['scaler']):
+            if load_optimizer and exists(self.accelerator.scaler) and exists(data['scaler']):
                 self.accelerator.scaler.load_state_dict(data['scaler'])
 
             print("load model - "+str(path))
+            if missing_keys:
+                print("missing keys: " + ", ".join(missing_keys))
+            if unexpected_keys:
+                print("unexpected keys: " + ", ".join(unexpected_keys))
+        else:
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
 
     def train(self):
         # 训练循环留在调度层，后续替换 optimizer、日志、resume 逻辑时更容易定位。
@@ -189,9 +209,11 @@ class Trainer(object):
                             raise ValueError(f"Unsupported Trainer data_mode: {self.data_mode}")
                         gt = data["gt"].to(self.device)
                         cond_input = data["adap"].to(self.device)
+                        haze_level_label = data["haze_level_label"].to(self.device)
+                        airlight_label = data["airlight_label"].to(self.device)
 
                         task = data["A_paths"]
-                        data = [gt, cond_input, task]
+                        data = [gt, cond_input, task, haze_level_label, airlight_label]
                     else:
                         data = next(self.dl)
                         data = data[0] if isinstance(data, list) else data
@@ -225,7 +247,18 @@ class Trainer(object):
                         milestone = self.step // self.save_and_sample_every
                         self.save(milestone)
 
-                pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
+                loss_terms = getattr(self.accelerator.unwrap_model(self.model), "latest_loss_terms", {})
+                if loss_terms:
+                    pbar.set_description(
+                        "loss_unet0: "
+                        f"{loss_terms.get('total_loss', total_loss[0]):.4f} | "
+                        f"recon: {loss_terms.get('recon_loss', 0.0):.4f} | "
+                        f"cls: {loss_terms.get('cls_loss', 0.0):.4f} | "
+                        f"haze: {loss_terms.get('haze_ce', 0.0):.4f} | "
+                        f"air: {loss_terms.get('airlight_ce', 0.0):.4f}"
+                    )
+                else:
+                    pbar.set_description(f'loss_unet0: {total_loss[0]:.4f}')
                 pbar.update(1)
 
         if accelerator.is_main_process and self.step > 0:

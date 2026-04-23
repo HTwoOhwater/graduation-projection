@@ -109,10 +109,22 @@ class DehazeSplitDataset(data.Dataset):
         clear = Image.open(clear_path).convert('RGB')
         clear = tfs.CenterCrop(haze.size[::-1])(clear)
         if not isinstance(self.size, str):
+            haze, clear = self.ensure_min_size(haze, clear, self.size)
             i, j, h, w = tfs.RandomCrop.get_params(haze, output_size=(self.size, self.size))
             haze = FF.crop(haze, i, j, h, w)
             clear = FF.crop(clear, i, j, h, w)
         haze, clear = self.augData(haze, clear)
+        return haze, clear
+
+    def ensure_min_size(self, haze, clear, min_size):
+        w, h = haze.size
+        if w >= min_size and h >= min_size:
+            return haze, clear
+        scale = max(min_size / max(w, 1), min_size / max(h, 1))
+        new_w = max(int(round(w * scale)), min_size)
+        new_h = max(int(round(h * scale)), min_size)
+        haze = haze.resize((new_w, new_h), Image.Resampling.BICUBIC)
+        clear = clear.resize((new_w, new_h), Image.Resampling.BICUBIC)
         return haze, clear
 
     def augData(self, data, target):

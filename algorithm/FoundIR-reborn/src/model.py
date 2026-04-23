@@ -348,7 +348,7 @@ class Unet(nn.Module):
         x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
         return x
     
-    def forward(self, x, time):
+    def forward_features(self, x, time):
         H, W = x.shape[2:]
         x = self.check_image_size(x, H, W)
         x = self.init_conv(x)
@@ -371,6 +371,7 @@ class Unet(nn.Module):
         x = self.mid_block1(x, t)
         x = self.mid_attn(x)
         x = self.mid_block2(x, t)
+        mid_features = x
 
         for block1, block2, attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim=1)
@@ -387,6 +388,10 @@ class Unet(nn.Module):
         x = self.final_res_block(x, t)
         x = self.final_conv(x)
         x = x[..., :H, :W].contiguous()
+        return x, mid_features
+
+    def forward(self, x, time):
+        x, _ = self.forward_features(x, time)
         return x
 
 
@@ -407,7 +412,10 @@ class UnetRes(nn.Module):
         num_unet=1,
         condition=False,
         objective='pred_res_noise',
-        test_res_or_noise="res_noise"
+        test_res_or_noise="res_noise",
+        use_class_loss=False,
+        num_haze_classes=10,
+        num_airlight_classes=6,
     ):
         super().__init__()
         self.condition = condition
@@ -418,6 +426,7 @@ class UnetRes(nn.Module):
         self.num_unet = num_unet
         self.objective = objective
         self.test_res_or_noise = test_res_or_noise
+        self.use_class_loss = use_class_loss
         # determine dimensions
     
         self.unet0 = Unet(dim,
@@ -431,13 +440,28 @@ class UnetRes(nn.Module):
                         random_fourier_features=random_fourier_features,
                         learned_sinusoidal_dim=learned_sinusoidal_dim,
                         condition=condition)
+        if self.use_class_loss:
+            mid_dim = dim * dim_mults[-1]
+            self.classifier_pool = nn.AdaptiveAvgPool2d(1)
+            self.haze_classifier = nn.Linear(mid_dim, num_haze_classes)
+            self.airlight_classifier = nn.Linear(mid_dim, num_airlight_classes)
 
-    def forward(self, x, time):
+    def forward_with_aux(self, x, time):
         if self.objective == "pred_noise":
             time = time[1]
         elif self.objective == "pred_res":
             time = time[0]
-        return [self.unet0(x, time)]
+        pred_res, mid_features = self.unet0.forward_features(x, time)
+        aux_outputs = {}
+        if self.use_class_loss:
+            pooled = self.classifier_pool(mid_features).flatten(1)
+            aux_outputs["haze_level_logits"] = self.haze_classifier(pooled)
+            aux_outputs["airlight_logits"] = self.airlight_classifier(pooled)
+        return [pred_res], aux_outputs
+
+    def forward(self, x, time):
+        outputs, _ = self.forward_with_aux(x, time)
+        return outputs
 
 # gaussian diffusion trainer class
 
@@ -533,6 +557,8 @@ class ResidualDiffusion(nn.Module):
         condition=False,
         sum_scale=None,
         test_res_or_noise="None",
+        use_class_loss=False,
+        class_loss_weight=0.05,
     ):
         super().__init__()
         assert not (
@@ -546,6 +572,9 @@ class ResidualDiffusion(nn.Module):
         self.condition = condition
         self.test_res_or_noise = test_res_or_noise
         self.delta_end = delta_end
+        self.use_class_loss = use_class_loss
+        self.class_loss_weight = class_loss_weight
+        self.latest_loss_terms = {}
 
         if self.condition:
             self.sum_scale = sum_scale if sum_scale else 0.01
@@ -978,11 +1007,23 @@ class ResidualDiffusion(nn.Module):
         else:
             raise ValueError(f'invalid loss type {loss_type}')
 
+    def compute_safe_ce(self, logits, labels):
+        valid = (labels >= 0) & (labels < logits.shape[1])
+        if not torch.any(valid):
+            return logits.new_tensor(0.0)
+        return F.cross_entropy(logits[valid], labels[valid])
+
     def p_losses(self, imgs, t, noise=None):
+        haze_level_label = None
+        airlight_label = None
         if isinstance(imgs, list):  # Condition
             x_input = 2 * imgs[1] - 1
             x_start = 2 * imgs[0] - 1  #gt:imgs[0], cond:imgs[1]
             task = imgs[2][0]
+            if len(imgs) > 3:
+                haze_level_label = imgs[3]
+            if len(imgs) > 4:
+                airlight_label = imgs[4]
 
 
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -999,9 +1040,19 @@ class ResidualDiffusion(nn.Module):
         else:
             x_in = torch.cat((x, x_input), dim=1)
 
-        model_out = self.model(x_in,
-                               [self.alphas_cumsum[t]*self.num_timesteps,
-                                self.betas_cumsum[t]*self.num_timesteps])
+        if hasattr(self.model, "forward_with_aux"):
+            model_out, aux_outputs = self.model.forward_with_aux(
+                x_in,
+                [self.alphas_cumsum[t]*self.num_timesteps,
+                 self.betas_cumsum[t]*self.num_timesteps]
+            )
+        else:
+            model_out = self.model(
+                x_in,
+                [self.alphas_cumsum[t]*self.num_timesteps,
+                 self.betas_cumsum[t]*self.num_timesteps]
+            )
+            aux_outputs = {}
 
         target = []
         if self.objective == 'pred_res_noise':
@@ -1041,6 +1092,25 @@ class ResidualDiffusion(nn.Module):
                 loss = self.loss_fn(model_out[i], target[i], reduction='none')
                 loss = reduce(loss, 'b ... -> b (...)', 'mean').mean()
                 loss_list.append(loss)
+            recon_loss = loss_list[0].detach()
+            haze_ce = loss_list[0].new_tensor(0.0)
+            airlight_ce = loss_list[0].new_tensor(0.0)
+            cls_loss = loss_list[0].new_tensor(0.0)
+            if self.use_class_loss and aux_outputs:
+                if haze_level_label is not None and "haze_level_logits" in aux_outputs:
+                    haze_ce = self.compute_safe_ce(aux_outputs["haze_level_logits"], haze_level_label)
+                if airlight_label is not None and "airlight_logits" in aux_outputs:
+                    airlight_ce = self.compute_safe_ce(aux_outputs["airlight_logits"], airlight_label)
+                cls_loss = haze_ce + airlight_ce
+                loss_list[0] = loss_list[0] + self.class_loss_weight * cls_loss
+
+            self.latest_loss_terms = {
+                "recon_loss": float(recon_loss.item()),
+                "cls_loss": float(cls_loss.detach().item()),
+                "haze_ce": float(haze_ce.detach().item()),
+                "airlight_ce": float(airlight_ce.detach().item()),
+                "total_loss": float(loss_list[0].detach().item()),
+            }
             return loss_list
 
     def forward(self, img, *args, **kwargs):

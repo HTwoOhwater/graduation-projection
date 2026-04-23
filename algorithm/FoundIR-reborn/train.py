@@ -7,9 +7,14 @@
 """
 
 import argparse
+from pathlib import Path
 from src.model import ResidualDiffusion, UnetRes, set_seed
 from src.trainer import Trainer
 from data.combined_dataset import CombinedDataset
+
+
+def default_output_dir():
+    return str(Path(__file__).resolve().parents[2] / "result" / "foundir_reborn_train")
 
 
 def parse_args():
@@ -38,6 +43,10 @@ def parse_args():
     parser.add_argument("--train_lr", type=float, default=1e-4)
     parser.add_argument("--gradient_accumulate_every", type=int, default=2)
     parser.add_argument("--ema_decay", type=float, default=0.995)
+    parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "adamw"])
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.99)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
     parser.add_argument("--split_batches", action="store_true",
                         help="Let Accelerate split a fixed global batch across devices. Leave off for normal per-device batching.")
@@ -48,9 +57,24 @@ def parse_args():
     parser.add_argument("--sum_scale", type=float, default=0.01)
     parser.add_argument("--delta_end", type=float, default=1.4e-3)
     parser.add_argument("--loss_type", type=str, default="l1", choices=["l1", "l2"])
-    parser.add_argument("--results_folder", type=str, default="./ckpt_single_multi")
-    parser.add_argument("--resume_milestone", type=int, default=0,
-                        help="Resume from model-<milestone>.pt in results_folder if > 0")
+    parser.add_argument("--use_class_loss", action="store_true",
+                        help="Enable auxiliary classification loss on haze level and airlight labels")
+    parser.add_argument("--class_loss_weight", type=float, default=0.05,
+                        help="Weight applied to the summed auxiliary classification losses")
+    parser.add_argument("--num_haze_classes", type=int, default=10)
+    parser.add_argument("--num_airlight_classes", type=int, default=6)
+    parser.add_argument("--output_dir", type=str, default=default_output_dir(),
+                        help="Directory used to save training checkpoints")
+    parser.add_argument("--results_folder", type=str, default=None,
+                        help="Deprecated alias of output_dir")
+    parser.add_argument("--resume_checkpoint", type=str, default=None,
+                        help="Checkpoint file path used to resume training")
+    parser.add_argument("--resume_load_step", action="store_true",
+                        help="Also load step from checkpoint. Off by default for finetuning.")
+    parser.add_argument("--resume_load_optimizer", action="store_true",
+                        help="Also load optimizer and scaler state from checkpoint. Off by default for finetuning.")
+    parser.add_argument("--resume_load_ema", action="store_true",
+                        help="Also load EMA state from checkpoint. Off by default for finetuning.")
     return parser.parse_args()
 
 
@@ -69,6 +93,8 @@ def build_dataset(args):
 
 def main():
     args = parse_args()
+    if args.results_folder is not None:
+        args.output_dir = args.results_folder
     set_seed(args.seed)
 
     # 入口层只负责“组装对象”，不直接写训练细节。
@@ -84,6 +110,9 @@ def main():
         condition=condition,
         objective=args.objective,
         test_res_or_noise=args.test_res_or_noise,
+        use_class_loss=args.use_class_loss,
+        num_haze_classes=args.num_haze_classes,
+        num_airlight_classes=args.num_airlight_classes,
     )
 
     diffusion = ResidualDiffusion(
@@ -97,6 +126,8 @@ def main():
         condition=condition,
         sum_scale=args.sum_scale,
         test_res_or_noise=args.test_res_or_noise,
+        use_class_loss=args.use_class_loss,
+        class_loss_weight=args.class_loss_weight,
     )
 
     # Trainer 负责训练调度，不再和模型定义混在一个文件里。
@@ -110,6 +141,9 @@ def main():
         train_num_steps=args.train_num_steps,
         gradient_accumulate_every=args.gradient_accumulate_every,
         ema_decay=args.ema_decay,
+        optimizer_name=args.optimizer,
+        adam_betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay,
         amp=args.mixed_precision != "no",
         fp16=args.mixed_precision == "fp16",
         mixed_precision=args.mixed_precision,
@@ -117,15 +151,20 @@ def main():
         num_workers=args.num_workers,
         pin_memory=not args.no_pin_memory,
         convert_image_to="RGB",
-        results_folder=args.results_folder,
+        results_folder=args.output_dir,
         condition=condition,
         save_and_sample_every=args.save_and_sample_every,
         num_unet=num_unet,
         data_mode=args.dataset_mode,
     )
 
-    if args.resume_milestone > 0:
-        trainer.load(args.resume_milestone)
+    if args.resume_checkpoint:
+        trainer.load(
+            args.resume_checkpoint,
+            load_step=args.resume_load_step,
+            load_optimizer=args.resume_load_optimizer,
+            load_ema=args.resume_load_ema,
+        )
     trainer.train()
 
 

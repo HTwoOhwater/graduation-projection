@@ -28,40 +28,30 @@ by Xu Qin, Zhilin Wang et al.    Peking University and Beijing University of Aer
 
 ### Datasets Preparation
 
-Dataset website:[RESIDE](https://sites.google.com/view/reside-dehaze-datasets/) ; Paper arXiv version:[[RESIDE: A Benchmark for Single Image Dehazing](https://www.google.com/url?q=https%3A%2F%2Farxiv.org%2Fpdf%2F1712.04143.pdf&sa=D&sntz=1&usg=AFQjCNHzdt3kMDsvuJ7Ef6R4ev59OFeRYA)]
+The original project was built for `RESIDE`, but the local copy in this repository has already been adapted to your custom paired dehazing dataset.
 
-<details>
-<summary> FILE STRUCTURE </summary>
+Current supported local dataset structure:
 
+```text
+datasets/
+  train/
+    haze_images/
+    original_images/
+  valid/
+    haze_images/
+    original_images/
+  test/
+    haze_images/
+    original_images/
 ```
-    FFA-Net
-    |-- README.md
-    |-- net
-    |-- data
-        |-- RESIDE
-            |-- ITS
-                |-- hazy
-                    |-- *.png
-                |-- clear
-                    |-- *.png
-            |-- OTS 
-                |-- hazy
-                    |-- *.jpg
-                |-- clear
-                    |-- *.jpg
-            |-- SOTS
-                |-- indoor
-                    |-- hazy
-                        |-- *.png
-                    |-- clear
-                        |-- *.png
-                |-- outdoor
-                    |-- hazy
-                        |-- *.jpg
-                    |-- clear
-                        |-- *.png
+
+Filename pairing supports the local pattern:
+
+```text
+cloudy_0007_1_2.jpg -> cloudy_0007.jpg
 ```
-</details>
+
+The last two suffixes are ignored for GT matching.
 
 
 ### Metrics update
@@ -75,39 +65,136 @@ Dataset website:[RESIDE](https://sites.google.com/view/reside-dehaze-datasets/) 
 |Ours|36.39/0.9886|33.57/0.9840|
 ### Usage
 
-#### Train
+#### Train on the local dehazing dataset
 
-*Remove annotation from [main.py](net/main.py) if you want to use `tensorboard` or view `intermediate predictions`*
+Train from scratch:
 
-*If you have more computing resources, expanding `bs`, `crop_size`, `gps`, `blocks` will lead to better results*
+```bash
+cd net
 
-train network on `ITS` dataset
-
- ```shell
- python main.py --net='ffa' --crop --crop_size=240 --blocks=19 --gps=3 --bs=2 --lr=0.0001 --trainset='its_train' --testset='its_test' --steps=500000 --eval_step=5000
- ```
-
-
-train network on `OTS` dataset
-
-
- ```shell
- python main.py --net='ffa' --crop --crop_size=240 --blocks=19 --gps=3 --bs=2 --lr=0.0001 --trainset='ots_train' --testset='ots_test' --steps=1000000 --eval_step=5000
- ```
-
-
-#### Test
-
-Trained_models are available at baidudrive: https://pan.baidu.com/s/1-pgSXN6-NXLzmTp21L_qIg with code: `4gat`
-
-or google drive: https://drive.google.com/drive/folders/19_lSUPrpLDZl9AyewhHBsHidZEpTMIV5?usp=sharing
-*Put  models in the `net/trained_models/`folder.*
-
-*Put your images in `net/test_imgs/`*
-
- ```shell
- python test.py --task='its or ots' --test_imgs='test_imgs'
+CUDA_VISIBLE_DEVICES=0 python main.py \
+  --net ffa \
+  --trainset dehaze_train \
+  --testset dehaze_test \
+  --dataroot /mnt/workspace/Dehaze/datasets \
+  --train_split train \
+  --test_split valid \
+  --lq_dirname haze_images \
+  --gt_dirname original_images \
+  --crop \
+  --crop_size 240 \
+  --bs 8 \
+  --steps 100000 \
+  --eval_step 5000 \
+  --gps 3 \
+  --blocks 19 \
+  --lr 1e-4 \
+  --num_workers 0 \
+  --output_dir /mnt/workspace/Dehaze/result/ffa_local_train
 ```
+
+#### Finetune from a pretrained checkpoint
+
+The local training entry now supports:
+
+- `--pretrained_checkpoint`: load model weights only
+- `--resume_checkpoint`: resume full training state
+- `--output_dir`: directory used to save checkpoints
+
+Example: transfer from the original ITS pretrained weights
+
+```bash
+cd net
+
+CUDA_VISIBLE_DEVICES=0 python main.py \
+  --net ffa \
+  --trainset dehaze_train \
+  --testset dehaze_test \
+  --dataroot /mnt/workspace/Dehaze/datasets \
+  --train_split train \
+  --test_split valid \
+  --lq_dirname haze_images \
+  --gt_dirname original_images \
+  --crop \
+  --crop_size 240 \
+  --bs 8 \
+  --steps 100000 \
+  --eval_step 5000 \
+  --gps 3 \
+  --blocks 19 \
+  --lr 1e-4 \
+  --num_workers 0 \
+  --output_dir /mnt/workspace/Dehaze/result/ffa_transfer_from_its \
+  --pretrained_checkpoint /mnt/workspace/Dehaze/algorithm/FFA-Net/its_train_ffa_3_19.pk
+```
+
+If you want to use the original OTS pretrained weights, replace the last argument with:
+
+```bash
+--pretrained_checkpoint /mnt/workspace/Dehaze/algorithm/FFA-Net/ots_train_ffa_3_19.pk
+```
+
+#### Resume local training
+
+```bash
+cd net
+
+CUDA_VISIBLE_DEVICES=0 python main.py \
+  --net ffa \
+  --trainset dehaze_train \
+  --testset dehaze_test \
+  --dataroot /mnt/workspace/Dehaze/datasets \
+  --train_split train \
+  --test_split valid \
+  --lq_dirname haze_images \
+  --gt_dirname original_images \
+  --crop \
+  --crop_size 240 \
+  --bs 8 \
+  --steps 100000 \
+  --eval_step 5000 \
+  --gps 3 \
+  --blocks 19 \
+  --lr 1e-4 \
+  --num_workers 0 \
+  --output_dir /mnt/workspace/Dehaze/result/ffa_transfer_from_its \
+  --resume_checkpoint /mnt/workspace/Dehaze/result/ffa_transfer_from_its/model-last.pt
+```
+
+Current local checkpoint format is:
+
+- `model-<step>.pt`
+- `model-last.pt`
+
+#### Test on local images
+
+The local `test.py` has also been adapted and now uses:
+
+- `--checkpoint`
+- `--input_dir`
+- `--output_dir`
+
+Example:
+
+```bash
+cd net
+
+CUDA_VISIBLE_DEVICES=0 python test.py \
+  --input_dir /mnt/workspace/Dehaze/datasets/test/haze_images \
+  --output_dir /mnt/workspace/Dehaze/result/ffa_test \
+  --checkpoint /mnt/workspace/Dehaze/result/ffa_transfer_from_its/model-last.pt \
+  --gps 3 \
+  --blocks 19 \
+  --skip_zero_suffix
+```
+
+#### Notes
+
+- If you hit multiprocessing cleanup errors under Python 3.12, prefer `--num_workers 0`.
+- If some training images are smaller than `crop_size`, the local dataset loader will now resize them up first and then crop, instead of crashing.
+- The original pretrained checkpoints still exist locally:
+  - `its_train_ffa_3_19.pk`
+  - `ots_train_ffa_3_19.pk`
 #### Samples
 
 <p align='center'>
@@ -121,4 +208,3 @@ or google drive: https://drive.google.com/drive/folders/19_lSUPrpLDZl9AyewhHBsHi
 <img src='fig/0099_0_FFA.png' height="606px" width='413px' >
 
 </div>
-

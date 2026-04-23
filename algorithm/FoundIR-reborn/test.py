@@ -10,9 +10,14 @@
 """
 
 import argparse
+from pathlib import Path
 from data.combined_dataset import CombinedDataset
 from src.model import ResidualDiffusion, UnetRes, set_seed
 from src.trainer import Trainer
+
+
+def default_output_dir():
+    return str(Path(__file__).resolve().parents[2] / "result" / "foundir_reborn_test")
 
 
 def parse_args():
@@ -41,10 +46,9 @@ def parse_args():
     parser.add_argument("--ddim_sampling_eta", type=float, default=0.0)
     parser.add_argument("--delta_end", type=float, default=1.4e-3)
     parser.add_argument("--loss_type", type=str, default="l1", choices=["l1", "l2"])
-    parser.add_argument("--checkpoint_dir", type=str, required=True,
-                        help="Directory containing model-<milestone>.pt")
-    parser.add_argument("--checkpoint_milestone", type=int, required=True)
-    parser.add_argument("--output_dir", type=str, default="./results")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Checkpoint file path")
+    parser.add_argument("--output_dir", type=str, default=default_output_dir())
     parser.add_argument("--crop_phase", type=str, default="im2overlap",
                         choices=["none", "weight", "im2overlap"])
     parser.add_argument("--crop_stride", type=int, default=512)
@@ -96,7 +100,7 @@ def main():
         test_res_or_noise=args.test_res_or_noise,
     )
 
-    # checkpoint_dir 只表示权重来源；output_dir 单独控制输出位置，避免语义混淆。
+    # output_dir 只表示结果输出位置；checkpoint 直接指向具体权重文件。
     trainer = Trainer(
         diffusion,
         dataset,
@@ -109,7 +113,7 @@ def main():
         ema_decay=0.995,
         amp=False,
         convert_image_to="RGB",
-        results_folder=args.checkpoint_dir,
+        results_folder=args.output_dir,
         condition=condition,
         save_and_sample_every=1000,
         num_unet=num_unet,
@@ -117,7 +121,7 @@ def main():
     )
 
     if trainer.accelerator.is_local_main_process:
-        trainer.load(args.checkpoint_milestone)
+        trainer.load(args.checkpoint, load_step=False, load_optimizer=False, load_ema=True)
         trainer.set_results_folder(args.output_dir)
         crop_phase = None if args.crop_phase == "none" else args.crop_phase
         trainer.test(

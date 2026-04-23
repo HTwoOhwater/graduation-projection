@@ -7,8 +7,7 @@ python test.py \
   --dataroot /path/to/dataset_root \
   --meta /path/to/test_meta.txt \
   --dataset_mode meta_info \
-  --checkpoint_dir ./ckpt_single_multi \
-  --checkpoint_milestone 2000 \
+  --checkpoint /path/to/model-last.pt \
   --output_dir ./results \
   --image_size 1024 \
   --sampling_timesteps 4 \
